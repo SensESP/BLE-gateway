@@ -28,15 +28,26 @@ void setup() {
                  ->enable_ota("ble-gw-ota")
                  ->get_app();
 
-  g_ble = std::make_shared<NativeBLE>();
+  // Passive scanning at roughly a 9% duty cycle. The library's own
+  // defaults are an active scan with the radio always on, which suits a
+  // chip whose only job is BLE; here WiFi wants the same radio and the
+  // same heap, and in a busy anchorage the full-rate scan buffers
+  // advertisements faster than they can be forwarded.
+  NativeBLEConfig ble_cfg;
+  ble_cfg.active_scan = false;
+  ble_cfg.scan_interval_ms = 320;
+  ble_cfg.scan_window_ms = 30;
+  g_ble = std::make_shared<NativeBLE>(ble_cfg);
 
   BLESignalKGatewayConfig gw_cfg;
+  gw_cfg.max_pending_ads = 50;
+  gw_cfg.post_interval_ms = 3000;
   gw_cfg.max_gatt_sessions = g_ble->max_gatt_connections();
 #ifdef CONFIG_IDF_TARGET_ESP32C3
-  // The C3 has a single 400 kB SRAM bank that WiFi, Bluedroid and
-  // TLS all draw from. A smaller advertisement buffer and no control
-  // WebSocket keep the HTTP POST path clear of the heap floor.
-  gw_cfg.max_pending_ads = 50;
+  // The C3 has a single 400 kB SRAM bank that WiFi, Bluedroid and TLS
+  // all draw from, and the control WebSocket is a second long-lived
+  // connection on top of the Signal K one. Advertisements still flow
+  // over the HTTP POST channel without it.
   gw_cfg.enable_control_ws = false;
 #endif
 

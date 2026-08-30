@@ -15,7 +15,16 @@ The gateway speaks two channels:
   handshake, periodic status frames and GATT commands.
 
 Both reuse the JWT that SensESP's `SKWSClient` already obtained through the
-normal Signal K access request, so there is no second pairing step.
+normal Signal K access request, so there is no second pairing step, and both
+follow its SSL setting — over TLS they borrow the CA that `SKWSClient` pinned on
+first use rather than running a second trust-on-first-use exchange of their own.
+If SSL is on and no CA has been pinned yet, the gateway holds off rather than
+send the token to a server it cannot verify.
+
+The advertisement connection is opened once, before the scanner starts, and held
+open. That ordering is deliberate: a TLS handshake needs a contiguous few
+kilobytes, and a running BLE scan fragments the heap within seconds, so a
+connection first attempted afterwards may never succeed at all.
 
 ## Requirements
 
@@ -110,9 +119,19 @@ through `symlink://../../`. Build one with `pio run -d examples/<name>`.
 ### A note on memory
 
 Bluedroid, WiFi and TLS all draw on internal SRAM, and on the smaller chips they
-add up. The ESP32-C3 example therefore trims `max_pending_ads` and turns the
-control WebSocket off; the C5 example does the same and drops to a ~9% scan duty
-cycle. If a build runs out of heap, those are the three knobs to reach for.
+add up. Buffering an advertisement copies it, so it costs several small
+allocations on the Bluetooth callback, and these builds compile without
+exceptions — an allocation that cannot be satisfied aborts the device instead of
+throwing. The gateway therefore refuses to buffer once the largest free block
+falls below `min_largest_free_block` (8 kB by default), dropping the
+advertisement and counting it.
+
+Keeping that headroom is the job of the scan settings. The examples scan
+passively at roughly a 9% duty cycle rather than the library's own
+always-on active scan, and buffer 50 advertisements rather than 500; the
+ESP32-C3 and C5 additionally turn the control WebSocket off, since it is a
+second long-lived connection. If a build still runs out of heap, those are the
+knobs to reach for.
 
 Flash is tight as well. Built `-Os` into a 1.9 MB OTA slot, the native example
 uses 89% of it on the ESP32 and the ESP32-S3 and 97% on the ESP32-C3, whose
