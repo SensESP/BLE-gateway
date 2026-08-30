@@ -1107,6 +1107,12 @@ void BLESignalKGateway::post_task_loop() {
     }
   }
 
+  // Set once a controller reset actually succeeds. Only the esp_hosted
+  // provisioner implements those hooks; the native ones inherit no-ops,
+  // and rebooting because a quiet anchorage produced no advertisements
+  // is not a recovery.
+  bool provisioner_can_reset = false;
+
   unsigned long last_status_ms = 0;
   uint32_t last_known_hits = 0;
   unsigned long last_hit_change_ms = millis();
@@ -1152,11 +1158,16 @@ void BLESignalKGateway::post_task_loop() {
           ble_provisioner_->stop_scan();
           vTaskDelay(pdMS_TO_TICKS(200));
           if (ble_provisioner_->reset_bt_controller()) {
+            provisioner_can_reset = true;
             vTaskDelay(pdMS_TO_TICKS(500));
-            ble_provisioner_->start_scan();
           } else {
-            ESP_LOGE(kTag, "BT controller RPC reset failed");
+            // Only the esp_hosted provisioner implements this; the
+            // native ones inherit a no-op. Leaving the scan stopped
+            // here would be permanent, because the escalation below is
+            // guarded on is_scanning() and could never fire again.
+            ESP_LOGE(kTag, "BT controller reset unavailable or failed");
           }
+          ble_provisioner_->start_scan();
         } else if (consecutive_restarts == 3) {
           // Level 3: GPIO hard-reset of the C6 chip. This power-
           // cycles the entire C6, clearing whatever stuck HCI state
@@ -1165,20 +1176,32 @@ void BLESignalKGateway::post_task_loop() {
                    "Scan watchdog: level 2 failed — GPIO hard-reset "
                    "of C6 (level 3)");
           if (ble_provisioner_->hard_reset_c6()) {
+            provisioner_can_reset = true;
             vTaskDelay(pdMS_TO_TICKS(500));
-            ble_provisioner_->start_scan();
           } else {
-            ESP_LOGE(kTag, "C6 GPIO hard-reset failed");
+            ESP_LOGE(kTag, "Co-processor hard reset unavailable or failed");
           }
+          ble_provisioner_->start_scan();
         } else {
-          // Level 4: reboot the entire device. The C6 is in a state
-          // that no software recovery can fix.
-          ESP_LOGE(kTag,
-                   "Scan watchdog: %d consecutive failures — rebooting "
-                   "(level 4)",
-                   consecutive_restarts);
-          vTaskDelay(pdMS_TO_TICKS(1000));
-          ESP.restart();
+          // Level 4: reboot. Only worth doing where the escalation
+          // above could actually act — on a provisioner with no reset
+          // hooks nothing has been tried but a scan restart, and an
+          // environment with no advertisers in range is not a fault.
+          if (!provisioner_can_reset) {
+            ESP_LOGW(kTag,
+                     "Scan watchdog: %d restarts with no advertisements; "
+                     "the provisioner has no controller reset, so not "
+                     "rebooting",
+                     consecutive_restarts);
+            consecutive_restarts = 0;
+          } else {
+            ESP_LOGE(kTag,
+                     "Scan watchdog: %d consecutive failures — rebooting "
+                     "(level 4)",
+                     consecutive_restarts);
+            vTaskDelay(pdMS_TO_TICKS(1000));
+            ESP.restart();
+          }
         }
         last_hit_change_ms = now;
       }
