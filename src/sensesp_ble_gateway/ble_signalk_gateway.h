@@ -10,6 +10,7 @@
 #include <mutex>
 #include <vector>
 
+#include "esp_http_client.h"
 #include "esp_websocket_client.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/semphr.h"
@@ -57,6 +58,32 @@ struct BLESignalKGatewayConfig {
   /// where the WS reconnect can exhaust internal RAM. Advertisements
   /// still flow via HTTP POST when the WS is disabled.
   bool enable_control_ws = true;
+
+  /// Smallest contiguous block of **internal** memory, in bytes, that
+  /// must remain free before an advertisement is buffered. Below it the
+  /// advertisement is dropped and counted.
+  ///
+  /// Buffering copies the advertisement, which means several small heap
+  /// allocations inside std::vector and String, on the Bluetooth host's
+  /// callback. This build compiles without exceptions, so an allocation
+  /// that cannot be satisfied aborts the device rather than throwing,
+  /// and those containers offer no failure-reporting form to check.
+  ///
+  /// This threshold is therefore an admission check, not a guarantee: it
+  /// declines work when memory is already low. It neither reserves the
+  /// memory nor rules out a failure between the check and the
+  /// allocation, so it lowers the odds of an abort rather than removing
+  /// them. The headroom also leaves room for a TLS handshake, which
+  /// needs a contiguous block of its own.
+  ///
+  /// Measured against internal RAM specifically: PSRAM is byte
+  /// addressable and would otherwise mask the shortage on the boards
+  /// that have it, which are the boards where internal RAM is tightest.
+  ///
+  /// New fields go after this one. This struct is a public aggregate,
+  /// so inserting a field in the middle silently rebinds any positional
+  /// brace initialization in consumer code.
+  size_t min_largest_free_block = 8192;
 };
 
 /**
@@ -99,13 +126,18 @@ struct BLESignalKGatewayConfig {
  *
  * ## GATT session handling
  *
- * gatt_subscribe / gatt_write / gatt_close commands received on the
- * control WS are currently logged and ignored. Full GATT client
- * support is out of scope for the first cut and will land in a
- * follow-up. The control WS and HTTP POST channels are still
- * useful on their own for running signalk-server against a gateway
- * that only relays advertisements (e.g. for Ruuvi / Victron beacons
- * that do not need GATT connections).
+ * gatt_subscribe / gatt_write / gatt_close are implemented on the
+ * Bluedroid provisioners, which carry a session state machine with
+ * notification subscriptions plus poll and periodic-write timers. The
+ * NimBLE provisioner relays advertisements only, and GATT commands
+ * reach the base class's no-op implementations there.
+ *
+ * The optional `with_response` and `write_before_read` fields of the
+ * server's GATT commands are not honoured.
+ *
+ * A gateway that only relays advertisements — Ruuvi and Victron
+ * beacons need no GATT connection — can run with the control WS off
+ * and use the HTTP POST channel alone.
  */
 class BLESignalKGateway {
  public:
@@ -125,7 +157,13 @@ class BLESignalKGateway {
    * Attaches observers to the BLE provisioner (to receive
    * advertisements) and to the SKWSClient's connection state
    * producer (to start/stop the control WS and HTTP POST task).
-   * Also starts the BLE scan on the provided provisioner.
+   *
+   * Scanning does not begin here. The POST task opens the delivery
+   * connection first and starts the scan once it is established, or
+   * after roughly twenty seconds if it cannot be. Over TLS that
+   * ordering is what makes the connection possible at all: the
+   * handshake needs a contiguous few kilobytes and a running scan
+   * fragments the heap within seconds.
    *
    * Safe to call once; subsequent calls are no-ops.
    */
@@ -189,8 +227,16 @@ class BLESignalKGateway {
   static void poll_timer_cb(TimerHandle_t timer);
   static void periodic_write_timer_cb(TimerHandle_t timer);
 
-  // Drain pending_ads_ and POST them to signalk-server.
-  void post_pending_advertisements();
+  /**
+   * @brief Drain pending_ads_ and POST them to signalk-server.
+   *
+   * @param allow_empty Send a batch even with nothing buffered. Used to
+   *        open the connection before the scanner starts; in normal
+   *        operation an empty buffer is skipped instead.
+   * @return true if the server accepted the batch, or there was nothing
+   *         to send. False means the delivery path is not working.
+   */
+  bool post_pending_advertisements(bool allow_empty = false);
 
   // FreeRTOS task that runs post_pending_advertisements() on a
   // timer. Started in start(), stopped in stop().
@@ -202,6 +248,66 @@ class BLESignalKGateway {
                                           esp_event_base_t base,
                                           int32_t event_id, void* event_data);
   void handle_control_ws_event(int32_t event_id, void* event_data);
+
+  /// How this gateway's own two channels should reach the server.
+  enum class Transport {
+    kPlaintext,    ///< SSL is off; connect over http:// and ws://.
+    kTls,          ///< SSL is on and a usable trust anchor is available.
+    kUnavailable,  ///< SSL is on but nothing can verify the server.
+  };
+
+  /**
+   * @brief Decide how this gateway's own two channels reach the server.
+   *
+   * The gateway talks to signalk-server on its own HTTP and WebSocket
+   * connections, separate from SKWSClient's delta socket, but to the
+   * same server and carrying the same bearer token. So it follows
+   * SKWSClient's SSL setting rather than deciding independently, and
+   * borrows the trust anchor SKWSClient pinned on first use instead of
+   * running a second, competing exchange.
+   *
+   * Borrowing the anchor is not enough on its own. SKWSClient pins an
+   * issuing CA and then binds the leaf's DNS SAN set in its own verify
+   * callback — without that binding, any leaf the CA ever signed is
+   * accepted, which is the whole risk with a public CA. A separate
+   * connection cannot inherit that callback, so this reproduces the
+   * binding by passing the pinned SAN as the expected certificate name.
+   *
+   * kUnavailable covers two cases the caller must not connect through,
+   * because both channels carry the Signal K token: no anchor pinned
+   * yet, and an anchor pinned in SKWSClient's leaf-fingerprint mode,
+   * which these clients have no way to express.
+   *
+   * @param ca_pem      Receives the pinned CA in PEM form for kTls.
+   * @param common_name Receives the certificate name to require, empty
+   *                    if the pinned anchor carries no bindable identity.
+   */
+  Transport resolve_transport(String& ca_pem, String& common_name) const;
+
+  /// Contiguous internal memory that must be free to buffer safely.
+  size_t required_free_block() const;
+
+  /**
+   * @brief Make sure the advertisement POST client exists and matches
+   *        the given endpoint.
+   *
+   * The client is kept alive between batches instead of being built and
+   * torn down around each one. Over TLS that matters a great deal: a
+   * handshake needs a contiguous few kilobytes, and once the scanner is
+   * running the heap is too fragmented to supply them on demand, so a
+   * client that reconnects every batch never connects at all. Holding
+   * one connection open means the cost is paid once.
+   *
+   * Rebuilds the client if the URL or the CA has changed since it was
+   * created; otherwise reuses it as is.
+   *
+   * @return true if post_client_ is usable.
+   */
+  bool ensure_post_client(const String& url, const String& ca_pem,
+                          const String& common_name);
+
+  /// Tear down the advertisement POST client, if any.
+  void destroy_post_client();
 
   std::shared_ptr<BLEProvisioner> ble_provisioner_;
   std::shared_ptr<SKWSClient> sk_client_;
@@ -218,13 +324,40 @@ class BLESignalKGateway {
   std::vector<BLEAdvertisement> pending_ads_;
   SemaphoreHandle_t pending_ads_mutex_ = nullptr;
 
-  // Control WebSocket client.
+  // Control WebSocket client. esp_websocket_client keeps the pointer it
+  // is handed rather than copying the PEM, so the string has to outlive
+  // the client.
   esp_websocket_client_handle_t control_ws_ = nullptr;
+  String control_ws_ca_pem_;
+  String control_ws_cn_;
   SemaphoreHandle_t control_ws_mutex_ = nullptr;
 
-  // Background POST task handle.
+  // Advertisement POST client, kept open across batches. Like the
+  // control WS, esp_http_client keeps the PEM pointer it is handed, so
+  // the string has to outlive the client. Touched only by the POST task
+  // and by that task's own shutdown path.
+  esp_http_client_handle_t post_client_ = nullptr;
+  String post_url_;
+  String post_ca_pem_;
+  String post_cn_;
+
+  // Set once the unsupported-anchor case has been reported, so a
+  // permanent condition is not logged every post interval.
+  mutable std::atomic<bool> tls_unavailable_logged_{false};
+
+  // Consecutive failed POST attempts. A kept-alive connection that the
+  // server or the network has killed cannot recover on its own, so the
+  // client is rebuilt once the streak crosses a threshold.
+  int post_failure_streak_ = 0;
+
+  // Background POST task handle. post_task_exited_ lets stop() wait for
+  // the task to leave the loop before the object's state is torn down;
+  // without it a stop()/start() pair can run two tasks against one
+  // esp_http_client handle, and the destructor can free the mutexes
+  // under a live task.
   TaskHandle_t post_task_ = nullptr;
   std::atomic<bool> post_task_should_run_{false};
+  std::atomic<bool> post_task_exited_{true};
 
   // Active GATT sessions keyed by session_id.
   std::map<String, std::unique_ptr<GATTSession>> gatt_sessions_;

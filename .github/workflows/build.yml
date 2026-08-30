@@ -11,7 +11,17 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        example: [p4_ble_gateway, c5_ble_gateway]
+        include:
+          - example: native_ble_gateway
+            env: esp32_ble_gateway
+          - example: native_ble_gateway
+            env: esp32s3_ble_gateway
+          - example: native_ble_gateway
+            env: esp32c3_ble_gateway
+          - example: p4_ble_gateway
+            env: p4_ble_gateway
+          - example: c5_ble_gateway
+            env: c5_ble_gateway
     steps:
       - uses: actions/checkout@v7
 
@@ -25,13 +35,13 @@ jobs:
           path: |
             ~/.platformio
             ~/.cache/pip
-          key: ${{ runner.os }}-pio-${{ matrix.example }}-${{ hashFiles(format('examples/{0}/platformio.ini', matrix.example)) }}
+          key: ${{ runner.os }}-pio-${{ matrix.env }}-${{ hashFiles(format('examples/{0}/platformio.ini', matrix.example)) }}
           restore-keys: |
-            ${{ runner.os }}-pio-${{ matrix.example }}-
+            ${{ runner.os }}-pio-${{ matrix.env }}-
             ${{ runner.os }}-pio-
 
       - name: Install PlatformIO
         run: pip install --upgrade platformio
 
-      - name: Build ${{ matrix.example }}
-        run: pio run -d examples/${{ matrix.example }}
+      - name: Build ${{ matrix.env }}
+        run: pio run -d examples/${{ matrix.example }} -e ${{ matrix.env }}

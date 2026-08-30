@@ -9,6 +9,34 @@
 #include "esp_bt_device.h"
 #include "esp_log.h"
 
+// Arduino-ESP32's initArduino() releases the entire Bluetooth controller
+// memory before setup() runs unless something claims it, and that release
+// makes esp_bt_controller_init() fail later with ESP_ERR_INVALID_STATE,
+// leaving a scanner that silently never scans. A library that drives the
+// controller through the IDF API never trips the core's own detection.
+//
+// Cores from 3.3 expose a header whose constructor sets the flag their
+// weak btInUse() reads, which composes with any other Bluetooth library
+// in the build. Older cores have no such header, and on the classic
+// ESP32 their btInUse() is a strong definition -- so the fallback below
+// collides at link time with Arduino's BLE or BluetoothSerial library.
+// Define SENSESP_BLE_GATEWAY_NO_BT_CLAIM to suppress it and claim the
+// controller yourself.
+//
+// The two native provisioners are mutually exclusive (Bluedroid and
+// NimBLE are a Kconfig choice), so at most one copy is compiled.
+#ifndef SENSESP_BLE_GATEWAY_NO_BT_CLAIM
+#if defined(__has_include)
+#if __has_include("esp32-hal-bt-mem.h")
+#include "esp32-hal-bt-mem.h"
+#define SENSESP_BLE_GATEWAY_BT_CLAIMED_BY_CORE
+#endif
+#endif
+#ifndef SENSESP_BLE_GATEWAY_BT_CLAIMED_BY_CORE
+extern "C" bool btInUse() { return true; }
+#endif
+#endif
+
 namespace sensesp {
 
 namespace {

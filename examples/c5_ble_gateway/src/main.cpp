@@ -21,7 +21,6 @@ void setup() {
 
   SensESPAppBuilder builder;
   auto app = builder.set_hostname(GATEWAY_HOSTNAME)
-                 ->set_wifi_client("MOIN", "Moin2018!")
                  ->enable_ota("c5-ble-gw-ota")
                  ->get_app();
 

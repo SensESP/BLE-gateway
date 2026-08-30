@@ -1,6 +1,7 @@
 #include "sensesp_ble_gateway/ble_signalk_gateway.h"
 
-#include <HTTPClient.h>
+#include "esp_heap_caps.h"
+#include "esp_http_client.h"
 
 #include "esp_idf_version.h"
 #include "esp_log.h"
@@ -18,6 +19,20 @@ constexpr const char* kAdvertisementsPath =
     "/signalk/v2/api/ble/gateway/advertisements";
 constexpr const char* kControlWsPathPrefix =
     "/signalk/v2/api/ble/gateway/ws?token=";
+
+// Consecutive POST failures tolerated before the connection is rebuilt.
+constexpr int kPostFailuresBeforeRebuild = 3;
+
+// Floor for timer periods that arrive over the control WebSocket.
+constexpr uint32_t kMinGattIntervalMs = 100;
+
+// SKWSClient stores the leaf's DNS SANs as a normalized, sorted,
+// comma-joined set. esp-tls verifies against a single name, so bind to
+// the first one.
+String first_san(const String& san_set) {
+  const int comma = san_set.indexOf(',');
+  return comma < 0 ? san_set : san_set.substring(0, comma);
+}
 
 String bytes_to_hex(const std::vector<uint8_t>& data) {
   String out;
@@ -93,20 +108,35 @@ void BLESignalKGateway::start() {
         }
       }));
 
-  if (config_.enable_control_ws && sk_client_->is_connected()) {
-    sk_connected_.store(true);
+  // connect_to() attaches without replaying the current value, so seed
+  // the state directly. Independent of the control WS: with it disabled,
+  // a gateway started while SK is already up would otherwise never post.
+  sk_connected_.store(sk_client_->is_connected());
+  if (config_.enable_control_ws && sk_connected_.load()) {
     init_control_ws();
   }
 
   // Start background POST task.
   post_task_should_run_.store(true);
-  xTaskCreate(&BLESignalKGateway::post_task_entry, "ble_gw_post", 8192, this,
-              1, &post_task_);
-
-  // Start scanning on the provided BLE provisioner.
-  if (!ble_provisioner_->is_scanning()) {
-    ble_provisioner_->start_scan();
+  post_task_exited_.store(false);
+  if (xTaskCreate(&BLESignalKGateway::post_task_entry, "ble_gw_post", 8192,
+                  this, 1, &post_task_) != pdPASS) {
+    // The task owns delivery, the scan watchdog and the scan start, so
+    // losing it would otherwise leave a gateway that reports itself
+    // running and does nothing at all. Scan anyway: a device that
+    // collects and drops is diagnosable, a silent one is not.
+    ESP_LOGE(kTag, "Failed to create the POST task — scanning without it");
+    post_task_ = nullptr;
+    post_task_should_run_.store(false);
+    post_task_exited_.store(true);
+    if (!ble_provisioner_->is_scanning()) {
+      ble_provisioner_->start_scan();
+    }
+    return;
   }
+
+  // Scanning is started by the POST task, not here — see
+  // post_task_loop(), which opens the delivery connection first.
 }
 
 void BLESignalKGateway::stop() {
@@ -119,10 +149,17 @@ void BLESignalKGateway::stop() {
   // Stop POST task. The task loop checks post_task_should_run_ on
   // each iteration and exits cleanly when it flips to false.
   post_task_should_run_.store(false);
-  // Intentionally NOT calling vTaskDelete here. The task will
-  // delete itself by calling vTaskDelete(nullptr) at the end of
-  // post_task_loop() so we avoid races with the task still holding
-  // the pending_ads_ mutex.
+  // The task deletes itself at the end of post_task_loop(); wait for it
+  // to get there. Returning early would let a following start() run a
+  // second task against the same esp_http_client handle, and would let
+  // the destructor free the mutexes while this one is still using them.
+  // Bounded so a task wedged in a socket timeout cannot hang the caller.
+  for (int i = 0; i < 100 && !post_task_exited_.load(); ++i) {
+    vTaskDelay(pdMS_TO_TICKS(100));
+  }
+  if (!post_task_exited_.load()) {
+    ESP_LOGW(kTag, "POST task did not exit within 10 s");
+  }
   post_task_ = nullptr;
 
   destroy_control_ws();
@@ -149,6 +186,13 @@ void BLESignalKGateway::on_advertisement() {
   }
   adv_received_count_.fetch_add(1, std::memory_order_relaxed);
 
+  if (heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL |
+                                      MALLOC_CAP_8BIT) <
+      required_free_block()) {
+    adv_dropped_count_.fetch_add(1, std::memory_order_relaxed);
+    return;
+  }
+
   const BLEAdvertisement& ad = ble_provisioner_->get();
 
   if (xSemaphoreTake(pending_ads_mutex_, pdMS_TO_TICKS(50)) != pdTRUE) {
@@ -161,13 +205,106 @@ void BLESignalKGateway::on_advertisement() {
     // Buffer full — drop oldest to keep newest. Cheap approximation:
     // drop the first half so we do not ping-pong on every new ad.
     const size_t keep = config_.max_pending_ads / 2;
-    pending_ads_.erase(pending_ads_.begin(),
-                       pending_ads_.begin() + (pending_ads_.size() - keep));
-    adv_dropped_count_.fetch_add(pending_ads_.size() - keep,
-                                 std::memory_order_relaxed);
+    const size_t dropped = pending_ads_.size() - keep;
+    pending_ads_.erase(pending_ads_.begin(), pending_ads_.begin() + dropped);
+    adv_dropped_count_.fetch_add(dropped, std::memory_order_relaxed);
   }
   pending_ads_.push_back(ad);
   xSemaphoreGive(pending_ads_mutex_);
+}
+
+size_t BLESignalKGateway::required_free_block() const {
+  // Buffering one advertisement costs a copy of the struct plus its
+  // strings and payload vector. The configured floor is the baseline;
+  // a large buffer needs room for its own growth step on top.
+  const size_t growth = config_.max_pending_ads * sizeof(BLEAdvertisement);
+  return config_.min_largest_free_block > growth
+             ? config_.min_largest_free_block
+             : growth;
+}
+
+BLESignalKGateway::Transport BLESignalKGateway::resolve_transport(
+    String& ca_pem, String& common_name) const {
+  ca_pem = "";
+  common_name = "";
+
+  if (!sk_client_->is_ssl_enabled()) {
+    return Transport::kPlaintext;
+  }
+  if (!sk_client_->has_tofu_ca()) {
+    if (!tls_unavailable_logged_.exchange(true)) {
+      if (sk_client_->has_tofu_fingerprint()) {
+        ESP_LOGE(kTag,
+                 "SSL is on and the Signal K client pinned a leaf "
+                 "fingerprint rather than a CA. The gateway's own channels "
+                 "cannot express that anchor, so they stay disabled. Give "
+                 "the server a certificate with its issuing CA in the chain "
+                 "to enable them.");
+      } else {
+        ESP_LOGE(kTag,
+                 "SSL is on but no trust anchor is pinned; the gateway's own "
+                 "channels stay disabled rather than send the Signal K token "
+                 "to a server they cannot verify.");
+      }
+    }
+    return Transport::kUnavailable;
+  }
+
+  ca_pem = sk_client_->get_tofu_ca();
+  common_name = first_san(sk_client_->get_tofu_san());
+  return Transport::kTls;
+}
+
+void BLESignalKGateway::destroy_post_client() {
+  if (post_client_ != nullptr) {
+    esp_http_client_cleanup(post_client_);
+    post_client_ = nullptr;
+  }
+  post_url_ = "";
+  post_ca_pem_ = "";
+  post_cn_ = "";
+}
+
+bool BLESignalKGateway::ensure_post_client(const String& url,
+                                           const String& ca_pem,
+                                           const String& common_name) {
+  if (post_client_ != nullptr && post_url_ == url && post_ca_pem_ == ca_pem &&
+      post_cn_ == common_name) {
+    return true;
+  }
+  destroy_post_client();
+
+  post_url_ = url;
+  post_ca_pem_ = ca_pem;
+  post_cn_ = common_name;
+
+  esp_http_client_config_t cfg = {};
+  cfg.url = post_url_.c_str();
+  cfg.method = HTTP_METHOD_POST;
+  cfg.timeout_ms = 3000;
+  cfg.keep_alive_enable = true;
+  // The advertisements endpoint is a fixed path on a known server. A
+  // redirect would carry the bearer token to whatever host it names, and
+  // a redirect to http:// would carry it in the clear.
+  cfg.disable_auto_redirect = true;
+  if (post_ca_pem_.length() > 0) {
+    cfg.cert_pem = post_ca_pem_.c_str();
+    if (post_cn_.length() > 0) {
+      cfg.common_name = post_cn_.c_str();
+    } else {
+      cfg.skip_cert_common_name_check = true;
+    }
+  }
+
+  post_client_ = esp_http_client_init(&cfg);
+  if (post_client_ == nullptr) {
+    ESP_LOGW(kTag, "esp_http_client_init failed");
+    post_url_ = "";
+    post_ca_pem_ = "";
+    post_cn_ = "";
+    return false;
+  }
+  return true;
 }
 
 void BLESignalKGateway::init_control_ws() {
@@ -192,10 +329,19 @@ void BLESignalKGateway::init_control_ws() {
     return;
   }
 
-  String url = String("ws://") + addr + ":" + String(port) +
+  const Transport transport =
+      resolve_transport(control_ws_ca_pem_, control_ws_cn_);
+  if (transport == Transport::kUnavailable) {
+    xSemaphoreGive(control_ws_mutex_);
+    return;
+  }
+  const bool use_tls = transport == Transport::kTls;
+  const char* scheme = use_tls ? "wss://" : "ws://";
+
+  String url = String(scheme) + addr + ":" + String(port) +
                kControlWsPathPrefix + token;
 
-  ESP_LOGI(kTag, "Connecting control WS to ws://%s:%u%s?token=<redacted>",
+  ESP_LOGI(kTag, "Connecting control WS to %s%s:%u%s?token=<redacted>", scheme,
            addr.c_str(), static_cast<unsigned>(port),
            "/signalk/v2/api/ble/gateway/ws");
 
@@ -203,6 +349,18 @@ void BLESignalKGateway::init_control_ws() {
   cfg.uri = url.c_str();
   cfg.task_stack = 4096;
   cfg.buffer_size = 1024;
+  if (use_tls) {
+    cfg.cert_pem = control_ws_ca_pem_.c_str();
+    if (control_ws_cn_.length() > 0) {
+      // The device dials the server by address, so the name on the
+      // certificate is checked against the identity pinned at first use
+      // rather than against the address. Without this the pinned CA
+      // would authorize any leaf it ever signed.
+      cfg.cert_common_name = control_ws_cn_.c_str();
+    } else {
+      cfg.skip_cert_common_name_check = true;
+    }
+  }
   // reconnect_timeout_ms and network_timeout_ms are only available
   // in the IDF component version of esp_websocket_client, not in the
   // Arduino-ESP32 prebuilt. Guard with a version check.
@@ -254,7 +412,16 @@ void BLESignalKGateway::send_hello() {
                        : config_.max_gatt_sessions;
   doc["active_gatt_connections"] =
       ble_provisioner_ ? ble_provisioner_->active_gatt_connections() : 0;
-  doc["mac"] = ble_provisioner_ ? ble_provisioner_->mac_address() : String("");
+  // signalk-server validates mac against a six-octet pattern and drops
+  // the entire frame if it fails, taking the session with it. The
+  // controller has no address until its stack is up, so omit the field
+  // rather than send an empty string.
+  if (ble_provisioner_) {
+    const String mac = ble_provisioner_->mac_address();
+    if (mac.length() > 0) {
+      doc["mac"] = mac;
+    }
+  }
   doc["hostname"] = SensESPBaseApp::get_hostname();
 
   // IP address from the network provisioner so the server can show
@@ -323,16 +490,16 @@ void BLESignalKGateway::handle_control_ws_message(uint8_t* payload,
   }
 }
 
-void BLESignalKGateway::post_pending_advertisements() {
+bool BLESignalKGateway::post_pending_advertisements(bool allow_empty) {
   if (!sk_connected_.load()) {
-    return;
+    return false;
   }
 
   String token = sk_client_->get_auth_token();
   String addr = sk_client_->get_server_address();
   uint16_t port = sk_client_->get_server_port();
   if (addr.length() == 0 || port == 0) {
-    return;
+    return false;
   }
   // An empty token is valid when the server has security disabled
   // (signalk-server returns 404 on access-request and SKWSClient
@@ -342,13 +509,18 @@ void BLESignalKGateway::post_pending_advertisements() {
   // Drain the pending buffer under the mutex.
   std::vector<BLEAdvertisement> to_post;
   if (xSemaphoreTake(pending_ads_mutex_, pdMS_TO_TICKS(200)) != pdTRUE) {
-    return;
+    return false;
   }
   to_post.swap(pending_ads_);
+  // swap() hands the reserved buffer to to_post, so without this the
+  // vector regrows from zero on the Bluetooth callback every cycle --
+  // a steady source of the fragmentation the delivery connection is
+  // held open to survive.
+  pending_ads_.reserve(config_.max_pending_ads);
   xSemaphoreGive(pending_ads_mutex_);
 
-  if (to_post.empty()) {
-    return;
+  if (to_post.empty() && !allow_empty) {
+    return true;
   }
 
   // Build the JSON batch.
@@ -382,39 +554,83 @@ void BLESignalKGateway::post_pending_advertisements() {
   String body;
   serializeJson(doc, body);
 
-  String url = String("http://") + addr + ":" + String(port) +
-               kAdvertisementsPath;
-
-  HTTPClient http;
-  http.begin(url);
-  http.addHeader("Content-Type", "application/json");
-  if (token.length() > 0) {
-    http.addHeader("Authorization", String("Bearer ") + token);
+  String ca_pem;
+  String common_name;
+  const Transport transport = resolve_transport(ca_pem, common_name);
+  if (transport == Transport::kUnavailable) {
+    http_post_fail_.fetch_add(1, std::memory_order_relaxed);
+    adv_dropped_count_.fetch_add(to_post.size(), std::memory_order_relaxed);
+    return false;
   }
-  http.addHeader("Connection", "close");
-  http.setTimeout(3000);
+  const bool use_tls = transport == Transport::kTls;
 
-  int code = http.POST(body);
+  String url = String(use_tls ? "https://" : "http://") + addr + ":" +
+               String(port) + kAdvertisementsPath;
+
+  if (!ensure_post_client(url, ca_pem, common_name)) {
+    http_post_fail_.fetch_add(1, std::memory_order_relaxed);
+    adv_dropped_count_.fetch_add(to_post.size(), std::memory_order_relaxed);
+    return false;
+  }
+
+  esp_http_client_set_header(post_client_, "Content-Type", "application/json");
+  if (token.length() > 0) {
+    String auth = String("Bearer ") + token;
+    esp_http_client_set_header(post_client_, "Authorization", auth.c_str());
+  } else {
+    // Headers live on the handle, and the handle now outlives the
+    // request. Without this an old bearer is replayed after the token
+    // is cleared.
+    esp_http_client_delete_header(post_client_, "Authorization");
+  }
+  esp_http_client_set_post_field(post_client_, body.c_str(), body.length());
+
+  const esp_err_t err = esp_http_client_perform(post_client_);
+  const int code =
+      err == ESP_OK ? esp_http_client_get_status_code(post_client_) : -err;
+
   if (code == 200) {
+    post_failure_streak_ = 0;
     adv_posted_count_.fetch_add(to_post.size(), std::memory_order_relaxed);
     http_post_success_.fetch_add(1, std::memory_order_relaxed);
     ESP_LOGI(kTag, "POST: forwarded %u adv, heap=%u",
              static_cast<unsigned>(to_post.size()),
              static_cast<unsigned>(ESP.getFreeHeap()));
-  } else if (code == 401 || code == 403) {
-    http_post_fail_.fetch_add(1, std::memory_order_relaxed);
+    return true;
+  }
+
+  http_post_fail_.fetch_add(1, std::memory_order_relaxed);
+  adv_dropped_count_.fetch_add(to_post.size(), std::memory_order_relaxed);
+  ++post_failure_streak_;
+
+  if (code == 401 || code == 403) {
+    // Deliberately does not restart the Signal K client. That client is
+    // shared with the rest of the device, SKWSClient documents restart()
+    // as event-loop-only, and a server that authenticates the delta
+    // socket while refusing this endpoint would otherwise have every
+    // sensor on the device torn down once per post interval.
     ESP_LOGW(kTag,
-             "POST: auth rejected (HTTP %d) — restarting main SK connection",
+             "POST: auth rejected (HTTP %d); the token is not accepted on "
+             "the BLE provider endpoint",
              code);
-    http.end();
-    sk_client_->restart();
-    return;
+  } else if (err != ESP_OK) {
+    ESP_LOGW(kTag, "POST failed: %s, heap=%u", esp_err_to_name(err),
+             static_cast<unsigned>(ESP.getFreeHeap()));
   } else {
-    http_post_fail_.fetch_add(1, std::memory_order_relaxed);
     ESP_LOGW(kTag, "POST failed: HTTP %d, heap=%u", code,
              static_cast<unsigned>(ESP.getFreeHeap()));
   }
-  http.end();
+
+  // A kept-alive handle whose socket has died stays dead: esp_http_client
+  // does not reset its state machine after a mid-request failure. Drop it
+  // so the next batch dials afresh.
+  if (post_failure_streak_ >= kPostFailuresBeforeRebuild) {
+    ESP_LOGW(kTag, "Rebuilding the delivery connection after %d failures",
+             post_failure_streak_);
+    destroy_post_client();
+    post_failure_streak_ = 0;
+  }
+  return false;
 }
 
 // -----------------------------------------------------------------
@@ -699,6 +915,13 @@ void BLESignalKGateway::gatt_run_subscribes(GATTSession* session) {
 void BLESignalKGateway::gatt_start_timers(GATTSession* session) {
   // Poll timers — periodically read a characteristic.
   for (auto& pd : session->polls) {
+    if (pd.interval_ms < kMinGattIntervalMs) {
+      // Comes straight off the control WebSocket. A zero period trips
+      // FreeRTOS's own assertion and reboots the device.
+      ESP_LOGW(kTag, "Ignoring poll descriptor with interval_ms=%u",
+               static_cast<unsigned>(pd.interval_ms));
+      continue;
+    }
     auto* ctx = new GATTTimerContext{this, session->session_id,
                                     pd.char_uuid, {}};
     TimerHandle_t t = xTimerCreate(
@@ -707,11 +930,20 @@ void BLESignalKGateway::gatt_start_timers(GATTSession* session) {
     if (t) {
       xTimerStart(t, 0);
       session->timers.push_back(t);
+    } else {
+      // Only the timer owns ctx, and cleanup reaches it through
+      // session->timers.
+      delete ctx;
     }
   }
 
   // Periodic write timers.
   for (auto& pw : session->periodic_writes) {
+    if (pw.interval_ms < kMinGattIntervalMs) {
+      ESP_LOGW(kTag, "Ignoring periodic write with interval_ms=%u",
+               static_cast<unsigned>(pw.interval_ms));
+      continue;
+    }
     auto* ctx = new GATTTimerContext{this, session->session_id,
                                     pw.char_uuid, pw.data};
     TimerHandle_t t = xTimerCreate(
@@ -720,6 +952,8 @@ void BLESignalKGateway::gatt_start_timers(GATTSession* session) {
     if (t) {
       xTimerStart(t, 0);
       session->timers.push_back(t);
+    } else {
+      delete ctx;
     }
   }
 }
@@ -849,6 +1083,42 @@ void BLESignalKGateway::post_task_entry(void* arg) {
 }
 
 void BLESignalKGateway::post_task_loop() {
+  // Open the delivery connection before the scanner runs. Over TLS the
+  // handshake needs a contiguous few kilobytes, and the advertisement
+  // flood fragments the heap within seconds of scanning, so a client
+  // that first connects afterwards may never connect at all. Priming it
+  // here costs one empty batch and, with keep-alive, holds for the life
+  // of the device.
+  //
+  // Bounded: on a server that never accepts us, scanning still starts,
+  // because a gateway that scans and drops is more useful for
+  // diagnosis than one that does nothing at all.
+  static constexpr int kPrimeAttempts = 20;
+  for (int attempt = 0; attempt < kPrimeAttempts; ++attempt) {
+    if (!post_task_should_run_.load()) {
+      break;
+    }
+    if (sk_connected_.load() && post_pending_advertisements(true)) {
+      ESP_LOGI(kTag, "Delivery connection established — starting scan");
+      break;
+    }
+    vTaskDelay(pdMS_TO_TICKS(1000));
+  }
+  // Only reached on a normal exit from the priming loop: a gateway
+  // stopped mid-prime must not turn the radio on behind stop()'s back.
+  if (post_task_should_run_.load() && ble_provisioner_ &&
+      !ble_provisioner_->is_scanning()) {
+    if (!ble_provisioner_->start_scan()) {
+      ESP_LOGE(kTag, "start_scan() failed");
+    }
+  }
+
+  // Set once a controller reset actually succeeds. Only the esp_hosted
+  // provisioner implements those hooks; the native ones inherit no-ops,
+  // and rebooting because a quiet anchorage produced no advertisements
+  // is not a recovery.
+  bool provisioner_can_reset = false;
+
   unsigned long last_status_ms = 0;
   uint32_t last_known_hits = 0;
   unsigned long last_hit_change_ms = millis();
@@ -894,11 +1164,16 @@ void BLESignalKGateway::post_task_loop() {
           ble_provisioner_->stop_scan();
           vTaskDelay(pdMS_TO_TICKS(200));
           if (ble_provisioner_->reset_bt_controller()) {
+            provisioner_can_reset = true;
             vTaskDelay(pdMS_TO_TICKS(500));
-            ble_provisioner_->start_scan();
           } else {
-            ESP_LOGE(kTag, "BT controller RPC reset failed");
+            // Only the esp_hosted provisioner implements this; the
+            // native ones inherit a no-op. Leaving the scan stopped
+            // here would be permanent, because the escalation below is
+            // guarded on is_scanning() and could never fire again.
+            ESP_LOGE(kTag, "BT controller reset unavailable or failed");
           }
+          ble_provisioner_->start_scan();
         } else if (consecutive_restarts == 3) {
           // Level 3: GPIO hard-reset of the C6 chip. This power-
           // cycles the entire C6, clearing whatever stuck HCI state
@@ -907,20 +1182,32 @@ void BLESignalKGateway::post_task_loop() {
                    "Scan watchdog: level 2 failed — GPIO hard-reset "
                    "of C6 (level 3)");
           if (ble_provisioner_->hard_reset_c6()) {
+            provisioner_can_reset = true;
             vTaskDelay(pdMS_TO_TICKS(500));
-            ble_provisioner_->start_scan();
           } else {
-            ESP_LOGE(kTag, "C6 GPIO hard-reset failed");
+            ESP_LOGE(kTag, "Co-processor hard reset unavailable or failed");
           }
+          ble_provisioner_->start_scan();
         } else {
-          // Level 4: reboot the entire device. The C6 is in a state
-          // that no software recovery can fix.
-          ESP_LOGE(kTag,
-                   "Scan watchdog: %d consecutive failures — rebooting "
-                   "(level 4)",
-                   consecutive_restarts);
-          vTaskDelay(pdMS_TO_TICKS(1000));
-          ESP.restart();
+          // Level 4: reboot. Only worth doing where the escalation
+          // above could actually act — on a provisioner with no reset
+          // hooks nothing has been tried but a scan restart, and an
+          // environment with no advertisers in range is not a fault.
+          if (!provisioner_can_reset) {
+            ESP_LOGW(kTag,
+                     "Scan watchdog: %d restarts with no advertisements; "
+                     "the provisioner has no controller reset, so not "
+                     "rebooting",
+                     consecutive_restarts);
+            consecutive_restarts = 0;
+          } else {
+            ESP_LOGE(kTag,
+                     "Scan watchdog: %d consecutive failures — rebooting "
+                     "(level 4)",
+                     consecutive_restarts);
+            vTaskDelay(pdMS_TO_TICKS(1000));
+            ESP.restart();
+          }
         }
         last_hit_change_ms = now;
       }
@@ -931,6 +1218,13 @@ void BLESignalKGateway::post_task_loop() {
       last_status_ms = now;
     }
   }
+  // Released here rather than in stop() so the client is only ever
+  // touched by this task.
+  destroy_post_client();
+
+  // Publish the exit before self-deleting so stop() can stop waiting.
+  post_task_exited_.store(true);
+
   // Self-delete so we do not leak a FreeRTOS task handle after stop().
   vTaskDelete(nullptr);
 }
