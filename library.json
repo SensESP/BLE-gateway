@@ -1,20 +1,41 @@
 {
-  "name": "SensESP BLE Gateway",
-  "version": "0.1.0",
-  "description": "BLE gateway for SensESP — bridges BLE devices to signalk-server's BLE provider API via HTTP POST and WebSocket",
-  "keywords": "ble, bluetooth, signalk, gateway, esp32, esp32-p4, esp32-c5, sensesp",
-  "repository": {
-    "type": "git",
-    "url": "https://github.com/dirkwa/sensesp-ble-gateway.git"
-  },
-  "license": "MIT",
-  "frameworks": ["arduino", "espidf"],
-  "platforms": ["espressif32"],
-  "dependencies": {
-    "SignalK/SensESP": ">=3.3.0"
-  },
-  "build": {
-    "srcFilter": ["+<*>"],
-    "includeDir": "src"
-  }
+    "name": "BLE-gateway",
+    "keywords": "BLE, Bluetooth, Bluetooth Low Energy, gateway, SensESP, Signal K, marine, boat, sensor",
+    "description": "BLE gateway for SensESP \u2014 bridges Bluetooth Low Energy devices to Signal K server's BLE provider API",
+    "repository": {
+        "type": "git",
+        "url": "https://github.com/SensESP/BLE-gateway.git"
+    },
+    "authors": [
+        {
+            "name": "Dirk Wahrheit",
+            "url": "https://github.com/dirkwa/"
+        },
+        {
+            "name": "Matti Airas",
+            "email": "mairas@iki.fi",
+            "url": "https://github.com/mairas/",
+            "maintainer": true
+        }
+    ],
+    "dependencies": [
+        {
+            "name": "SensESP",
+            "owner": "signalk",
+            "version": "^3.5.0"
+        }
+    ],
+    "version": "1.0.0",
+    "license": "Apache-2.0",
+    "frameworks": [
+        "arduino",
+        "espidf"
+    ],
+    "platforms": "espressif32",
+    "build": {
+        "srcFilter": [
+            "+<*>"
+        ],
+        "includeDir": "src"
+    }
 }
