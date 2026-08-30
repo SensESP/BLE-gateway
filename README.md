@@ -17,9 +17,16 @@ The gateway speaks two channels:
 Both reuse the JWT that SensESP's `SKWSClient` already obtained through the
 normal Signal K access request, so there is no second pairing step, and both
 follow its SSL setting — over TLS they borrow the CA that `SKWSClient` pinned on
-first use rather than running a second trust-on-first-use exchange of their own.
-If SSL is on and no CA has been pinned yet, the gateway holds off rather than
-send the token to a server it cannot verify.
+first use, and require the certificate to carry the same name that was bound
+when it was pinned, rather than running a second trust-on-first-use exchange of
+their own. Without that name check a pinned CA would authorize any certificate
+it ever signed.
+
+Two cases leave the gateway's channels disabled rather than sending the Signal K
+token to a server they cannot verify: nothing pinned yet, and a server whose
+certificate arrives without its issuing CA, where `SKWSClient` pins a leaf
+fingerprint that these clients cannot express. Both are reported once at error
+level.
 
 The advertisement connection is opened once, before the scanner starts, and held
 open. That ordering is deliberate: a TLS handshake needs a contiguous few
@@ -68,8 +75,20 @@ using namespace sensesp;
 SensESPAppBuilder builder;
 auto app = builder.set_hostname("signalk-ble-gw")->get_app();
 
-auto ble = std::make_shared<NativeBLE>();
-auto gateway = std::make_shared<BLESignalKGateway>(ble, app->get_ws_client());
+// The library's defaults scan actively with the radio always on, which
+// suits a chip whose only job is BLE. Sharing one with WiFi and TLS
+// wants a lower duty cycle and a smaller buffer — see the memory note.
+NativeBLEConfig ble_cfg;
+ble_cfg.active_scan = false;
+ble_cfg.scan_interval_ms = 320;
+ble_cfg.scan_window_ms = 30;
+auto ble = std::make_shared<NativeBLE>(ble_cfg);
+
+BLESignalKGatewayConfig gw_cfg;
+gw_cfg.max_pending_ads = 50;
+
+auto gateway =
+    std::make_shared<BLESignalKGateway>(ble, app->get_ws_client(), gw_cfg);
 gateway->start();
 ```
 
@@ -102,8 +121,10 @@ hard reset of the companion chip, to a reboot.
 | Waveshare ESP32-P4-WIFI6-POE-ETH | `EspHostedBluedroidBLE` | Ethernet | Advertisements, control WebSocket and GATT |
 | Waveshare ESP32-C5-WIFI6-KIT | `NimBLEProvisioner` | WiFi | Advertisements only; control WebSocket off to save RAM |
 
-The ESP32, ESP32-S3 and ESP32-C3 environments are built in CI but have not been
-run against a Signal K server on real hardware. Reports welcome.
+| SH-ESP32 (ESP32) | `NativeBLE` | WiFi | Advertisements over plaintext HTTP |
+
+The ESP32-S3 and ESP32-C3 environments are built in CI but have not been run
+against a Signal K server. Reports welcome.
 
 ## Examples
 
