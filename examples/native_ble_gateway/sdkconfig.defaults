@@ -1,0 +1,59 @@
+# Shared IDF configuration for the native-BLE gateway example.
+# Target-agnostic on purpose: the same file serves the ESP32,
+# ESP32-S3 and ESP32-C3 environments.
+
+# Arduino-as-IDF-component knob — without it the Arduino runtime is
+# never started and setup()/loop() never run.
+CONFIG_AUTOSTART_ARDUINO=y
+
+# Flash size and partition table. 4 MB is what every one of the three
+# targets has at minimum, so one layout serves all of them: two OTA app
+# slots of 1.875 MB each, a small SPIFFS and a coredump partition.
+CONFIG_ESPTOOLPY_FLASHSIZE_4MB=y
+CONFIG_ESPTOOLPY_FLASHSIZE="4MB"
+CONFIG_PARTITION_TABLE_CUSTOM=y
+CONFIG_PARTITION_TABLE_CUSTOM_FILENAME="partitions_4mb.csv"
+CONFIG_PARTITION_TABLE_FILENAME="partitions_4mb.csv"
+
+# Optimize for size. The IDF default is -Og, which leaves the firmware
+# barely inside a 1.9 MB OTA slot once Bluedroid, WiFi and TLS are in.
+CONFIG_COMPILER_OPTIMIZATION_SIZE=y
+
+# Match SensESP's own [espidf] settings so its assumptions hold.
+CONFIG_FREERTOS_HZ=1000
+CONFIG_ESP_MAIN_TASK_STACK_SIZE=8192
+
+# Bluetooth host: Bluedroid in BLE-central mode. GATTC is the client
+# role NativeBLE exposes; the gateway never acts as a peripheral, so
+# the server role and BLE Mesh stay off to save RAM.
+CONFIG_BT_ENABLED=y
+CONFIG_BT_BLUEDROID_ENABLED=y
+CONFIG_BT_BLE_ENABLED=y
+CONFIG_BT_GATTC_ENABLE=y
+CONFIG_BT_GATTS_ENABLE=n
+CONFIG_BT_CLASSIC_ENABLED=n
+CONFIG_BLE_MESH=n
+
+# BLE 4.2 legacy scan/advertising APIs. NativeBLE uses
+# esp_ble_gap_set_scan_params(), which belongs to that feature set.
+CONFIG_BT_BLE_42_FEATURES_SUPPORTED=y
+CONFIG_BT_BLE_50_FEATURES_SUPPORTED=n
+
+CONFIG_BT_BTU_TASK_STACK_SIZE=8192
+
+# 3 concurrent GATT connections plus one link reserved for scanning.
+CONFIG_BT_ACL_CONNECTIONS=4
+
+# Bluedroid plus WiFi overflows the classic ESP32's IRAM. Keeping the
+# WiFi fast paths in flash instead frees enough of it to link. The cost
+# is a little WiFi throughput, which a BLE gateway never approaches.
+CONFIG_ESP_WIFI_IRAM_OPT=n
+CONFIG_ESP_WIFI_RX_IRAM_OPT=n
+
+# WiFi and BLE share one radio on all three targets.
+CONFIG_SW_COEXIST_ENABLE=y
+
+# Misc — match SensESP's top-level [espidf] env.
+CONFIG_MBEDTLS_PSK_MODES=y
+CONFIG_MBEDTLS_KEY_EXCHANGE_PSK=y
+CONFIG_HTTPD_MAX_REQ_HDR_LEN=1024

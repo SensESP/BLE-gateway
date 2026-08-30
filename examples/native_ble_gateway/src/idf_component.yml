@@ -1,0 +1,10 @@
+## IDF component manifest for the native-BLE gateway example.
+##
+## esp_websocket_client carries the gateway's control WebSocket. It is
+## an ESP-IDF component, not a PlatformIO library, and declaring it
+## here is what puts its headers on the include path of every
+## component in the build — including SensESP, which needs them too.
+
+dependencies:
+  idf: '>=5.3'
+  espressif/esp_websocket_client: '^1.3'
