@@ -1,0 +1,106 @@
+language: en-US
+
+reviews:
+  profile: assertive
+  auto_review:
+    enabled: true
+    drafts: false
+  high_level_summary_instructions: |
+    Write all summaries in present tense.
+    Describe what the code does, not what it did.
+    Example: "This PR adds feature X" instead of "This PR added feature X"
+
+  path_instructions:
+    - path: '**/*'
+      instructions: |
+        ## Contribution guidelines compliance
+        Check that the PR follows the SensESP contribution guidelines:
+        https://github.com/SignalK/SensESP/blob/main/docs/pages/contributing_code/index.md
+        Flag any deviation in PR structure, commit message format, or documentation
+        requirements. In particular: commits should be small and atomic, pure
+        reformatting belongs in its own commit, and the branch should not carry
+        merge commits from upstream.
+
+        ## Echo comments
+        Flag any comment that merely restates what the code already says.
+        Examples of echo comments to flag:
+        - `// Set the pin` above a method named `set_pin()`
+        - `// Loop through the sensors` above a `for` loop
+        These add noise without adding meaning. Request removal or replacement
+        with a comment explaining *why*, not *what*.
+        Doxygen blocks are exempt — see below.
+
+        ## Doxygen documentation of public API
+        Public classes and methods in `src/**/*.h` are the library's API surface.
+        Flag a new public class that has no `/** @brief ... */` block, and a
+        documented constructor whose parameters are not covered by `@param`.
+        Never flag a Doxygen block as an echo comment, even when it repeats the
+        class or parameter name — these blocks are required.
+
+        ## Leftover crumbs from intermediate commits
+        Check for references to things that existed in earlier commits of this PR
+        but are no longer present — removed variables, old function names, deleted
+        files, superseded approaches. These are confusing to future readers.
+        Flag any comments, docs, or code that refer to something not present in
+        the current state of the branch.
+
+        ## Documentation drift risk
+        Flag any .md file that contains detailed implementation steps, specific
+        API call sequences, code snippets, or configuration values that are likely
+        to fall out of sync as the code evolves. Documentation should describe
+        architecture and how things work conceptually — not step-by-step
+        instructions that duplicate or shadow the code itself.
+
+        ## Unchecked items in test plans
+        If a PR description or any .md file contains a checklist with unchecked
+        items, flag it. Either the work is incomplete, or the checklist should be
+        removed before merge. Do not let unchecked boxes pass silently.
+
+        ## Implementation status in documentation
+        Flag any .md file that describes implementation progress, status, or
+        build steps (e.g. "Step 3: implement X", "TODO: add Y", "currently
+        implemented as Z"). This belongs in PR descriptions or commit messages,
+        not in documentation. Documentation should describe how things work,
+        not how they were built or what stage they are in.
+        Architecture decisions and design rationale are fine. Build narratives
+        are not.
+
+        ## Callback context
+        Code reached from a Bluetooth host callback or a FreeRTOS task other than
+        the main loop must not block and must not log at high frequency. These
+        builds compile without exceptions, so a failed allocation aborts the
+        device rather than throwing.
+
+        Prefer not allocating there at all. Where an allocation is unavoidable,
+        prefer a form that reports failure and check its result. A heap query is
+        an admission signal only: it reserves nothing, says nothing about
+        fragmentation, and another task can take the memory between the check and
+        the allocation. Do not accept a heap pre-check as evidence that a
+        callback-path allocation is safe, and flag comments or documentation that
+        present one as a guarantee.
+
+        ## Secrets and local infrastructure
+        Flag any WiFi credential, Signal K token, hostname, IP address or other
+        site-specific detail committed to source, docs or example configuration.
+        Examples must take these from the SensESP configuration UI or from build
+        flags, never from literals in the tree.
+
+        ## What NOT to flag
+        Do not flag the following patterns — they are intentional:
+        - Identifier naming inherited from SensESP: trailing underscore on private
+          and protected members, `k` prefix on constants and enum constants,
+          `lower_case` variables, `CamelCase` types. Do not suggest renames
+          towards other conventions.
+        - Google-style formatting with a 2-space indent, and SensESP's include
+          ordering. Formatting nits are not review material here.
+        - Provisioner sources guarded by `#if defined(CONFIG_BT_...)`. Only one
+          Bluetooth host is ever compiled, so the alternatives being unreachable
+          in a given build is by design, not dead code.
+        - The absence of unit tests for code that talks to Bluedroid, NimBLE or
+          esp_hosted. That code only builds and runs on target; CI builds the
+          examples instead.
+
+        ## Scope
+        Focus on files changed since main. Think carefully about how changes
+        interact with existing code and documentation — not just the diff in
+        isolation.
