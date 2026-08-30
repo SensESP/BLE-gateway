@@ -11,6 +11,18 @@
 #include "nimble/nimble_port.h"
 #include "nimble/nimble_port_freertos.h"
 
+// Arduino-ESP32's initArduino() releases the entire Bluetooth controller
+// memory before setup() runs unless a strong btInUse() claims it -- the
+// core's own definition is weak and returns false, and only Arduino's
+// own BLE and BluetoothSerial libraries override it. A library that
+// drives the controller through the IDF API instead never trips that,
+// and the release makes esp_bt_controller_init() fail later with
+// ESP_ERR_INVALID_STATE, leaving a scanner that silently never scans.
+//
+// The two native provisioners are mutually exclusive (Bluedroid and
+// NimBLE are a Kconfig choice), so exactly one definition is compiled.
+extern "C" bool btInUse() { return true; }
+
 namespace sensesp {
 
 namespace {
