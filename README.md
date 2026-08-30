@@ -124,7 +124,7 @@ hard reset of the companion chip, to a reboot.
 | SH-ESP32 (ESP32) | `NativeBLE` | WiFi | Advertisements over plaintext HTTP |
 
 The ESP32-S3 and ESP32-C3 environments are built in CI but have not been run
-against a Signal K server. Reports welcome.
+against a Signal K server. Reports are welcome.
 
 ## Examples
 
@@ -143,9 +143,12 @@ Bluedroid, WiFi and TLS all draw on internal SRAM, and on the smaller chips they
 add up. Buffering an advertisement copies it, so it costs several small
 allocations on the Bluetooth callback, and these builds compile without
 exceptions — an allocation that cannot be satisfied aborts the device instead of
-throwing. The gateway therefore refuses to buffer once the largest free block
-falls below `min_largest_free_block` (8 kB by default), dropping the
-advertisement and counting it.
+throwing, and the containers involved offer no failure-reporting form to check.
+The gateway therefore declines to buffer once the largest free block of internal
+memory falls below `min_largest_free_block` (8 kB by default, raised to fit the
+configured buffer), dropping the advertisement and counting it. That is an
+admission check rather than a guarantee: it does not reserve the memory, so it
+lowers the chance of an abort rather than removing it.
 
 Keeping that headroom is the job of the scan settings. The examples scan
 passively at roughly a 9% duty cycle rather than the library's own

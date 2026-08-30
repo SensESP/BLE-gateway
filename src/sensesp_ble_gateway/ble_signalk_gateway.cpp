@@ -915,8 +915,6 @@ void BLESignalKGateway::gatt_run_subscribes(GATTSession* session) {
 void BLESignalKGateway::gatt_start_timers(GATTSession* session) {
   // Poll timers — periodically read a characteristic.
   for (auto& pd : session->polls) {
-    auto* ctx = new GATTTimerContext{this, session->session_id,
-                                    pd.char_uuid, {}};
     if (pd.interval_ms < kMinGattIntervalMs) {
       // Comes straight off the control WebSocket. A zero period trips
       // FreeRTOS's own assertion and reboots the device.
@@ -924,12 +922,18 @@ void BLESignalKGateway::gatt_start_timers(GATTSession* session) {
                static_cast<unsigned>(pd.interval_ms));
       continue;
     }
+    auto* ctx = new GATTTimerContext{this, session->session_id,
+                                    pd.char_uuid, {}};
     TimerHandle_t t = xTimerCreate(
         "gatt_poll", pdMS_TO_TICKS(pd.interval_ms), pdTRUE, ctx,
         &BLESignalKGateway::poll_timer_cb);
     if (t) {
       xTimerStart(t, 0);
       session->timers.push_back(t);
+    } else {
+      // Only the timer owns ctx, and cleanup reaches it through
+      // session->timers.
+      delete ctx;
     }
   }
 
@@ -948,6 +952,8 @@ void BLESignalKGateway::gatt_start_timers(GATTSession* session) {
     if (t) {
       xTimerStart(t, 0);
       session->timers.push_back(t);
+    } else {
+      delete ctx;
     }
   }
 }

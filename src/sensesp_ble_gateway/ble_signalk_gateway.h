@@ -64,11 +64,16 @@ struct BLESignalKGatewayConfig {
   /// advertisement is dropped and counted.
   ///
   /// Buffering copies the advertisement, which means several small heap
-  /// allocations, and it happens on the Bluetooth host's callback. This
-  /// build compiles without exceptions, so an allocation that cannot be
-  /// satisfied aborts the device rather than throwing -- there is
-  /// nothing to catch. Checking first is the only way to refuse the work
-  /// safely. The headroom also leaves room for a TLS handshake, which
+  /// allocations inside std::vector and String, on the Bluetooth host's
+  /// callback. This build compiles without exceptions, so an allocation
+  /// that cannot be satisfied aborts the device rather than throwing,
+  /// and those containers offer no failure-reporting form to check.
+  ///
+  /// This threshold is therefore an admission check, not a guarantee: it
+  /// declines work when memory is already low. It neither reserves the
+  /// memory nor rules out a failure between the check and the
+  /// allocation, so it lowers the odds of an abort rather than removing
+  /// them. The headroom also leaves room for a TLS handshake, which
   /// needs a contiguous block of its own.
   ///
   /// Measured against internal RAM specifically: PSRAM is byte
