@@ -1,6 +1,7 @@
 #include "sensesp_ble_gateway/ble_signalk_gateway.h"
 
-#include <HTTPClient.h>
+#include "esp_heap_caps.h"
+#include "esp_http_client.h"
 
 #include "esp_idf_version.h"
 #include "esp_log.h"
@@ -103,10 +104,8 @@ void BLESignalKGateway::start() {
   xTaskCreate(&BLESignalKGateway::post_task_entry, "ble_gw_post", 8192, this,
               1, &post_task_);
 
-  // Start scanning on the provided BLE provisioner.
-  if (!ble_provisioner_->is_scanning()) {
-    ble_provisioner_->start_scan();
-  }
+  // Scanning is started by the POST task, not here — see
+  // post_task_loop(), which opens the delivery connection first.
 }
 
 void BLESignalKGateway::stop() {
@@ -149,6 +148,12 @@ void BLESignalKGateway::on_advertisement() {
   }
   adv_received_count_.fetch_add(1, std::memory_order_relaxed);
 
+  if (heap_caps_get_largest_free_block(MALLOC_CAP_8BIT) <
+      config_.min_largest_free_block) {
+    adv_dropped_count_.fetch_add(1, std::memory_order_relaxed);
+    return;
+  }
+
   const BLEAdvertisement& ad = ble_provisioner_->get();
 
   if (xSemaphoreTake(pending_ads_mutex_, pdMS_TO_TICKS(50)) != pdTRUE) {
@@ -168,6 +173,57 @@ void BLESignalKGateway::on_advertisement() {
   }
   pending_ads_.push_back(ad);
   xSemaphoreGive(pending_ads_mutex_);
+}
+
+bool BLESignalKGateway::resolve_transport(String& ca_pem) const {
+  ca_pem = "";
+  if (!sk_client_->is_ssl_enabled()) {
+    return true;
+  }
+  if (!sk_client_->has_tofu_ca()) {
+    return false;
+  }
+  ca_pem = sk_client_->get_tofu_ca();
+  return true;
+}
+
+void BLESignalKGateway::destroy_post_client() {
+  if (post_client_ != nullptr) {
+    esp_http_client_cleanup(post_client_);
+    post_client_ = nullptr;
+  }
+  post_url_ = "";
+  post_ca_pem_ = "";
+}
+
+bool BLESignalKGateway::ensure_post_client(const String& url,
+                                           const String& ca_pem) {
+  if (post_client_ != nullptr && post_url_ == url && post_ca_pem_ == ca_pem) {
+    return true;
+  }
+  destroy_post_client();
+
+  post_url_ = url;
+  post_ca_pem_ = ca_pem;
+
+  esp_http_client_config_t cfg = {};
+  cfg.url = post_url_.c_str();
+  cfg.method = HTTP_METHOD_POST;
+  cfg.timeout_ms = 3000;
+  cfg.keep_alive_enable = true;
+  if (post_ca_pem_.length() > 0) {
+    cfg.cert_pem = post_ca_pem_.c_str();
+    cfg.skip_cert_common_name_check = true;
+  }
+
+  post_client_ = esp_http_client_init(&cfg);
+  if (post_client_ == nullptr) {
+    ESP_LOGW(kTag, "esp_http_client_init failed");
+    post_url_ = "";
+    post_ca_pem_ = "";
+    return false;
+  }
+  return true;
 }
 
 void BLESignalKGateway::init_control_ws() {
@@ -192,10 +248,20 @@ void BLESignalKGateway::init_control_ws() {
     return;
   }
 
-  String url = String("ws://") + addr + ":" + String(port) +
+  if (!resolve_transport(control_ws_ca_pem_)) {
+    ESP_LOGW(kTag,
+             "SSL is on but no CA is pinned yet; deferring control WS rather "
+             "than sending the token to an unverified server");
+    xSemaphoreGive(control_ws_mutex_);
+    return;
+  }
+  const bool use_tls = control_ws_ca_pem_.length() > 0;
+  const char* scheme = use_tls ? "wss://" : "ws://";
+
+  String url = String(scheme) + addr + ":" + String(port) +
                kControlWsPathPrefix + token;
 
-  ESP_LOGI(kTag, "Connecting control WS to ws://%s:%u%s?token=<redacted>",
+  ESP_LOGI(kTag, "Connecting control WS to %s%s:%u%s?token=<redacted>", scheme,
            addr.c_str(), static_cast<unsigned>(port),
            "/signalk/v2/api/ble/gateway/ws");
 
@@ -203,6 +269,13 @@ void BLESignalKGateway::init_control_ws() {
   cfg.uri = url.c_str();
   cfg.task_stack = 4096;
   cfg.buffer_size = 1024;
+  if (use_tls) {
+    cfg.cert_pem = control_ws_ca_pem_.c_str();
+    // The device reaches the server by address, not by the name on the
+    // certificate. SKWSClient skips the same check and binds identity
+    // through the SAN set it captured at pin time instead.
+    cfg.skip_cert_common_name_check = true;
+  }
   // reconnect_timeout_ms and network_timeout_ms are only available
   // in the IDF component version of esp_websocket_client, not in the
   // Arduino-ESP32 prebuilt. Guard with a version check.
@@ -323,16 +396,16 @@ void BLESignalKGateway::handle_control_ws_message(uint8_t* payload,
   }
 }
 
-void BLESignalKGateway::post_pending_advertisements() {
+bool BLESignalKGateway::post_pending_advertisements(bool allow_empty) {
   if (!sk_connected_.load()) {
-    return;
+    return false;
   }
 
   String token = sk_client_->get_auth_token();
   String addr = sk_client_->get_server_address();
   uint16_t port = sk_client_->get_server_port();
   if (addr.length() == 0 || port == 0) {
-    return;
+    return false;
   }
   // An empty token is valid when the server has security disabled
   // (signalk-server returns 404 on access-request and SKWSClient
@@ -342,13 +415,13 @@ void BLESignalKGateway::post_pending_advertisements() {
   // Drain the pending buffer under the mutex.
   std::vector<BLEAdvertisement> to_post;
   if (xSemaphoreTake(pending_ads_mutex_, pdMS_TO_TICKS(200)) != pdTRUE) {
-    return;
+    return false;
   }
   to_post.swap(pending_ads_);
   xSemaphoreGive(pending_ads_mutex_);
 
-  if (to_post.empty()) {
-    return;
+  if (to_post.empty() && !allow_empty) {
+    return true;
   }
 
   // Build the JSON batch.
@@ -382,19 +455,35 @@ void BLESignalKGateway::post_pending_advertisements() {
   String body;
   serializeJson(doc, body);
 
-  String url = String("http://") + addr + ":" + String(port) +
-               kAdvertisementsPath;
-
-  HTTPClient http;
-  http.begin(url);
-  http.addHeader("Content-Type", "application/json");
-  if (token.length() > 0) {
-    http.addHeader("Authorization", String("Bearer ") + token);
+  String ca_pem;
+  if (!resolve_transport(ca_pem)) {
+    http_post_fail_.fetch_add(1, std::memory_order_relaxed);
+    ESP_LOGW(kTag,
+             "SSL is on but no CA is pinned yet; dropping this batch rather "
+             "than posting the token to an unverified server");
+    return false;
   }
-  http.addHeader("Connection", "close");
-  http.setTimeout(3000);
+  const bool use_tls = ca_pem.length() > 0;
 
-  int code = http.POST(body);
+  String url = String(use_tls ? "https://" : "http://") + addr + ":" +
+               String(port) + kAdvertisementsPath;
+
+  if (!ensure_post_client(url, ca_pem)) {
+    http_post_fail_.fetch_add(1, std::memory_order_relaxed);
+    return false;
+  }
+
+  esp_http_client_set_header(post_client_, "Content-Type", "application/json");
+  if (token.length() > 0) {
+    String auth = String("Bearer ") + token;
+    esp_http_client_set_header(post_client_, "Authorization", auth.c_str());
+  }
+  esp_http_client_set_post_field(post_client_, body.c_str(), body.length());
+
+  const esp_err_t err = esp_http_client_perform(post_client_);
+  const int code =
+      err == ESP_OK ? esp_http_client_get_status_code(post_client_) : -err;
+
   if (code == 200) {
     adv_posted_count_.fetch_add(to_post.size(), std::memory_order_relaxed);
     http_post_success_.fetch_add(1, std::memory_order_relaxed);
@@ -406,15 +495,14 @@ void BLESignalKGateway::post_pending_advertisements() {
     ESP_LOGW(kTag,
              "POST: auth rejected (HTTP %d) — restarting main SK connection",
              code);
-    http.end();
     sk_client_->restart();
-    return;
+    return false;
   } else {
     http_post_fail_.fetch_add(1, std::memory_order_relaxed);
     ESP_LOGW(kTag, "POST failed: HTTP %d, heap=%u", code,
              static_cast<unsigned>(ESP.getFreeHeap()));
   }
-  http.end();
+  return code == 200;
 }
 
 // -----------------------------------------------------------------
@@ -849,6 +937,31 @@ void BLESignalKGateway::post_task_entry(void* arg) {
 }
 
 void BLESignalKGateway::post_task_loop() {
+  // Open the delivery connection before the scanner runs. Over TLS the
+  // handshake needs a contiguous few kilobytes, and the advertisement
+  // flood fragments the heap within seconds of scanning, so a client
+  // that first connects afterwards may never connect at all. Priming it
+  // here costs one empty batch and, with keep-alive, holds for the life
+  // of the device.
+  //
+  // Bounded: on a server that never accepts us, scanning still starts,
+  // because a gateway that scans and drops is more useful for
+  // diagnosis than one that does nothing at all.
+  static constexpr int kPrimeAttempts = 20;
+  for (int attempt = 0; attempt < kPrimeAttempts; ++attempt) {
+    if (!post_task_should_run_.load()) {
+      break;
+    }
+    if (sk_connected_.load() && post_pending_advertisements(true)) {
+      ESP_LOGI(kTag, "Delivery connection established — starting scan");
+      break;
+    }
+    vTaskDelay(pdMS_TO_TICKS(1000));
+  }
+  if (ble_provisioner_ && !ble_provisioner_->is_scanning()) {
+    ble_provisioner_->start_scan();
+  }
+
   unsigned long last_status_ms = 0;
   uint32_t last_known_hits = 0;
   unsigned long last_hit_change_ms = millis();
@@ -931,6 +1044,10 @@ void BLESignalKGateway::post_task_loop() {
       last_status_ms = now;
     }
   }
+  // Released here rather than in stop() so the client is only ever
+  // touched by this task.
+  destroy_post_client();
+
   // Self-delete so we do not leak a FreeRTOS task handle after stop().
   vTaskDelete(nullptr);
 }

@@ -10,6 +10,7 @@
 #include <mutex>
 #include <vector>
 
+#include "esp_http_client.h"
 #include "esp_websocket_client.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/semphr.h"
@@ -51,6 +52,19 @@ struct BLESignalKGatewayConfig {
 
   /// Max GATT sessions advertised in the hello message.
   int max_gatt_sessions = 0;
+
+  /// Smallest contiguous free block, in bytes, that must remain before
+  /// an advertisement is buffered. Below it the advertisement is
+  /// dropped and counted.
+  ///
+  /// Buffering copies the advertisement, which means several small heap
+  /// allocations, and it happens on the Bluetooth host's callback. This
+  /// build compiles without exceptions, so an allocation that cannot be
+  /// satisfied aborts the device rather than throwing -- there is
+  /// nothing to catch. Checking first is the only way to refuse the
+  /// work safely. The headroom also leaves room for a TLS handshake,
+  /// which needs a contiguous block of its own.
+  size_t min_largest_free_block = 8192;
 
   /// Enable the control WebSocket (hello, status, GATT commands).
   /// Disable on memory-constrained chips (e.g. C5 with WiFi+BLE)
@@ -189,8 +203,16 @@ class BLESignalKGateway {
   static void poll_timer_cb(TimerHandle_t timer);
   static void periodic_write_timer_cb(TimerHandle_t timer);
 
-  // Drain pending_ads_ and POST them to signalk-server.
-  void post_pending_advertisements();
+  /**
+   * @brief Drain pending_ads_ and POST them to signalk-server.
+   *
+   * @param allow_empty Send a batch even with nothing buffered. Used to
+   *        open the connection before the scanner starts; in normal
+   *        operation an empty buffer is skipped instead.
+   * @return true if the server accepted the batch, or there was nothing
+   *         to send. False means the delivery path is not working.
+   */
+  bool post_pending_advertisements(bool allow_empty = false);
 
   // FreeRTOS task that runs post_pending_advertisements() on a
   // timer. Started in start(), stopped in stop().
@@ -202,6 +224,45 @@ class BLESignalKGateway {
                                           esp_event_base_t base,
                                           int32_t event_id, void* event_data);
   void handle_control_ws_event(int32_t event_id, void* event_data);
+
+  /**
+   * @brief Decide how this gateway's own two channels reach the server.
+   *
+   * The gateway talks to signalk-server on its own HTTP and WebSocket
+   * connections, separate from SKWSClient's delta socket, but to the
+   * same server and carrying the same bearer token. So it follows
+   * SKWSClient's SSL setting rather than deciding independently, and
+   * borrows the CA that SKWSClient pinned through its trust-on-first-use
+   * handshake instead of running a second, competing TOFU exchange.
+   *
+   * @param ca_pem Receives the pinned CA in PEM form when TLS is in use.
+   * @return true if a connection may be made. False means TLS is on but
+   *         no pinned CA is available to verify the server with, in
+   *         which case the caller must not connect: both channels carry
+   *         the Signal K token, and an unverified peer could collect it.
+   */
+  bool resolve_transport(String& ca_pem) const;
+
+  /**
+   * @brief Make sure the advertisement POST client exists and matches
+   *        the given endpoint.
+   *
+   * The client is kept alive between batches instead of being built and
+   * torn down around each one. Over TLS that matters a great deal: a
+   * handshake needs a contiguous few kilobytes, and once the scanner is
+   * running the heap is too fragmented to supply them on demand, so a
+   * client that reconnects every batch never connects at all. Holding
+   * one connection open means the cost is paid once.
+   *
+   * Rebuilds the client if the URL or the CA has changed since it was
+   * created; otherwise reuses it as is.
+   *
+   * @return true if post_client_ is usable.
+   */
+  bool ensure_post_client(const String& url, const String& ca_pem);
+
+  /// Tear down the advertisement POST client, if any.
+  void destroy_post_client();
 
   std::shared_ptr<BLEProvisioner> ble_provisioner_;
   std::shared_ptr<SKWSClient> sk_client_;
@@ -218,9 +279,20 @@ class BLESignalKGateway {
   std::vector<BLEAdvertisement> pending_ads_;
   SemaphoreHandle_t pending_ads_mutex_ = nullptr;
 
-  // Control WebSocket client.
+  // Control WebSocket client. esp_websocket_client keeps the pointer it
+  // is handed rather than copying the PEM, so the string has to outlive
+  // the client.
   esp_websocket_client_handle_t control_ws_ = nullptr;
+  String control_ws_ca_pem_;
   SemaphoreHandle_t control_ws_mutex_ = nullptr;
+
+  // Advertisement POST client, kept open across batches. Like the
+  // control WS, esp_http_client keeps the PEM pointer it is handed, so
+  // the string has to outlive the client. Touched only by the POST task
+  // and by that task's own shutdown path.
+  esp_http_client_handle_t post_client_ = nullptr;
+  String post_url_;
+  String post_ca_pem_;
 
   // Background POST task handle.
   TaskHandle_t post_task_ = nullptr;
