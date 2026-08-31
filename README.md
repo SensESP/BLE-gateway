@@ -29,9 +29,11 @@ fingerprint that these clients cannot express. Both are reported once at error
 level.
 
 The advertisement connection is opened once, before the scanner starts, and held
-open. That ordering is deliberate: a TLS handshake needs a contiguous few
-kilobytes, and a running BLE scan fragments the heap within seconds, so a
-connection first attempted afterwards may never succeed at all.
+open. That ordering is deliberate: a TLS handshake needs a contiguous
+block of tens of kilobytes, and buffering the advertisements a scan produces
+fragments the heap within seconds, so a connection first attempted afterwards
+may never succeed at all. The scan by itself is not the problem: with nothing
+buffering them, 90 s of scanning left the largest free block unchanged.
 
 ## Requirements
 
@@ -40,6 +42,17 @@ connection first attempted afterwards may never succeed at all.
 - PlatformIO with the [pioarduino](https://github.com/pioarduino/platform-espressif32)
   platform, built as `framework = espidf, arduino` — the library calls ESP-IDF
   Bluetooth APIs directly and needs the Bluetooth host turned on in `sdkconfig`
+
+Over TLS, mbedTLS must be left allocating its record buffers once per
+connection rather than once per read and write. Allocating them per operation
+means every POST needs a fresh contiguous block, and once the heap is
+fragmented one fails on a connection that is still open and that nothing has
+closed — a failure that looks like a network fault and is not one.
+
+The settings that hold that, and the measurements behind them, are in
+[`examples/native_ble_gateway/sdkconfig.defaults`](examples/native_ble_gateway/sdkconfig.defaults).
+Copy them into your own project's `sdkconfig.defaults`; a project that builds
+its own configuration will not inherit them from the library.
 
 ## Quick start
 

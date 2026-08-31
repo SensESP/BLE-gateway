@@ -38,3 +38,9 @@ CONFIG_ESP_INSIGHTS_ENABLED=n
 CONFIG_MBEDTLS_PSK_MODES=y
 CONFIG_MBEDTLS_KEY_EXCHANGE_PSK=y
 CONFIG_HTTPD_MAX_REQ_HDR_LEN=1024
+
+# TLS record buffers. This target sets CONFIG_MBEDTLS_EXTERNAL_MEM_ALLOC above,
+# so mbedTLS allocates from PSRAM and the internal-RAM fragmentation that
+# motivates this pin on the ESP32 does not apply here. Kept so the three
+# examples do not disagree about a setting whose failure mode is silent.
+CONFIG_MBEDTLS_DYNAMIC_BUFFER=n

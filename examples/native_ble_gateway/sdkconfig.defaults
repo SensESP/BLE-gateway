@@ -57,3 +57,30 @@ CONFIG_SW_COEXIST_ENABLE=y
 CONFIG_MBEDTLS_PSK_MODES=y
 CONFIG_MBEDTLS_KEY_EXCHANGE_PSK=y
 CONFIG_HTTPD_MAX_REQ_HDR_LEN=1024
+
+# ---------------------------------------------------------------------
+# TLS record buffers. Measured on this target (ESP32, no PSRAM) against a
+# Traefik TLS entrypoint; see "A note on memory" in the README.
+# ---------------------------------------------------------------------
+
+# With dynamic buffers on, esp_ssl_tls.c wraps
+# mbedtls_ssl_write/read so the TLS record buffer is allocated per call and
+# freed again, and once the heap has no ~4.4 kB contiguous block a POST fails
+# with ESP_ERR_HTTP_WRITE_DATA on a connection that is still open. Off is the
+# IDF default; pinned because nothing else holds it and the failure is silent.
+#
+# The cost is that every open session keeps its buffers for its lifetime:
+# about 16.4 kB in and 4.1 kB out. This gateway can hold three at once — the
+# POST client, the control WebSocket and SKWSClient's delta socket — so on a
+# board without PSRAM that is roughly 60 kB of internal RAM committed to TLS.
+# Turning the option on to reclaim that is what reintroduces the failure.
+CONFIG_MBEDTLS_DYNAMIC_BUFFER=n
+
+# The record buffer cannot be trimmed to buy contiguous memory back. RFC 6066
+# max_fragment_length is how a client asks for smaller records, and Go's TLS
+# server does not implement it, so the server sends whatever fits its own
+# data. Measured by fetching a 350 kB asset from the same entrypoint — not a
+# response this endpoint returns, but it shows what the server is free to
+# send: at 8192 the transfer failed after 21775 bytes, at 4096 after 4090.
+# 16384 is the IDF default and is the only safe value.
+CONFIG_MBEDTLS_SSL_IN_CONTENT_LEN=16384
