@@ -45,6 +45,15 @@ constexpr uint32_t kPostBackoffCapMs = 300000;
 // Floor for timer periods that arrive over the control WebSocket.
 constexpr uint32_t kMinGattIntervalMs = 100;
 
+// Capacity handed to the pending buffer for the short window between draining
+// a batch and restoring the full reservation. Without it the buffer sits at
+// zero capacity and the GAP callback grows it from nothing, one doubling at a
+// time, in a build with exceptions disabled. Sized for the window rather than
+// the buffer: at the ~15 advertisements/s a busy anchorage produces and a
+// window measured at 100 ms, this is two orders of magnitude of headroom, and
+// it costs about 2 kB against the ~28 kB a full second array would.
+constexpr size_t kDrainWindowReserve = 32;
+
 // SKWSClient stores the leaf's DNS SANs as a normalized, sorted,
 // comma-joined set. esp-tls verifies against a single name, so bind to
 // the first one.
@@ -560,6 +569,11 @@ bool BLESignalKGateway::post_pending_advertisements(bool allow_empty) {
     return false;
   }
   to_post.swap(pending_ads_);
+  // Small interim capacity so advertisements arriving before the full
+  // reservation is restored do not have to allocate from the GAP callback.
+  pending_ads_.reserve(config_.max_pending_ads < kDrainWindowReserve
+                           ? config_.max_pending_ads
+                           : kDrainWindowReserve);
   BLE_GW_HEAP_PROBE("drain.swapped", to_post.size(), pending_ads_.capacity());
   xSemaphoreGive(pending_ads_mutex_);
   // The buffer is deliberately left at zero capacity until the batch has been
@@ -616,18 +630,16 @@ bool BLESignalKGateway::post_pending_advertisements(bool allow_empty) {
 
   String body;
   serializeJson(doc, body);
-  // Peak of the cycle: both element arrays plus the JsonDocument plus the
-  // serialized body are all live here.
   BLE_GW_HEAP_PROBE("body.built", batch_size, pending_ads_.capacity());
 
-#ifdef BLE_GW_RELEASE_BATCH_EARLY
-  // Candidate fix under measurement: the batch is already serialized into
-  // body, so nothing downstream reads it. Releasing it here returns the
-  // element array and every string and payload vector it owns before the
-  // POST needs its buffers.
+  // The batch is serialized into body and nothing downstream reads it, so
+  // release it and restore the reservation now rather than at function exit.
+  // That returns the element array, its strings and its payload vectors before
+  // the POST needs buffers of its own, and it ends the reduced-capacity window
+  // here instead of after a POST that can take seconds. The guard above still
+  // covers the early returns that never reach this point.
   { std::vector<BLEAdvertisement>().swap(to_post); }
-  BLE_GW_HEAP_PROBE("batch.released", batch_size, pending_ads_.capacity());
-#endif
+  restore_pending_capacity();
 
   String ca_pem;
   String common_name;
