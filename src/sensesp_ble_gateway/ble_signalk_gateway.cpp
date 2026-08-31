@@ -221,6 +221,15 @@ void BLESignalKGateway::on_advertisement() {
     return;
   }
 
+  // A zero-length buffer means buffer nothing, and saying so here is what
+  // makes it mean that. Falling through would let the first push allocate
+  // the element array on this callback, after which the buffer would behave
+  // as if it held one.
+  if (config_.max_pending_ads == 0) {
+    adv_dropped_count_.fetch_add(1, std::memory_order_relaxed);
+    return;
+  }
+
   const BLEAdvertisement& ad = ble_provisioner_->get();
 
   if (xSemaphoreTake(pending_ads_mutex_, pdMS_TO_TICKS(50)) != pdTRUE) {
@@ -234,7 +243,9 @@ void BLESignalKGateway::on_advertisement() {
   // reserved for the window rather than the whole buffer, and pushing past
   // that would reallocate here — on the Bluetooth host's callback, in a
   // build without exceptions, where a failed allocation aborts the device.
-  // Trimming instead keeps the push non-allocating on every path.
+  // Trimming instead keeps the element array off this callback's allocation
+  // path. The copy itself still allocates the advertisement's name string
+  // and payload vectors, as it always has; only the array is covered here.
   const size_t capacity = pending_ads_.capacity() < config_.max_pending_ads
                               ? pending_ads_.capacity()
                               : config_.max_pending_ads;
