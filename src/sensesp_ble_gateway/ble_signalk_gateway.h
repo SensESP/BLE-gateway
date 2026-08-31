@@ -287,14 +287,16 @@ class BLESignalKGateway {
    * connection cannot inherit that callback, so this reproduces the
    * binding by passing the pinned SAN as the expected certificate name.
    *
-   * kUnavailable covers two cases the caller must not connect through,
+   * kUnavailable covers three cases the caller must not connect through,
    * because both channels carry the Signal K token: no anchor pinned
-   * yet, and an anchor pinned in SKWSClient's leaf-fingerprint mode,
-   * which these clients have no way to express.
+   * yet, an anchor pinned in SKWSClient's leaf-fingerprint mode, which
+   * these clients have no way to express, and a pinned CA with no
+   * stored identity, which would authorize every leaf that CA signed.
    *
    * @param ca_pem      Receives the pinned CA in PEM form for kTls.
-   * @param common_name Receives the certificate name to require, empty
-   *                    if the pinned anchor carries no bindable identity.
+   * @param common_name Receives the certificate name to require. Never
+   *                    empty for kTls: an anchor without a bindable
+   *                    identity resolves to kUnavailable instead.
    */
   Transport resolve_transport(String& ca_pem, String& common_name) const;
 
