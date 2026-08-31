@@ -40,7 +40,6 @@ void setup() {
   g_ble = std::make_shared<NativeBLE>(ble_cfg);
 
   BLESignalKGatewayConfig gw_cfg;
-  gw_cfg.max_pending_ads = 50;
   gw_cfg.post_interval_ms = 3000;
   gw_cfg.max_gatt_sessions = g_ble->max_gatt_connections();
 #ifdef CONFIG_IDF_TARGET_ESP32C3

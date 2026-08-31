@@ -31,9 +31,7 @@ void setup() {
   ble_cfg.scan_window_ms = 30;  // ~9% duty
   g_ble = std::make_shared<NimBLEProvisioner>(ble_cfg);
 
-  // Smaller ad buffer and faster POST interval to keep heap stable.
   BLESignalKGatewayConfig gw_cfg;
-  gw_cfg.max_pending_ads = 50;
   gw_cfg.post_interval_ms = 3000;
   gw_cfg.enable_control_ws = false;  // Save RAM on the C5
   g_gateway =
