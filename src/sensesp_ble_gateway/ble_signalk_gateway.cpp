@@ -20,8 +20,10 @@ constexpr const char* kAdvertisementsPath =
 constexpr const char* kControlWsPathPrefix =
     "/signalk/v2/api/ble/gateway/ws?token=";
 
-// Consecutive POST failures tolerated before the connection is rebuilt.
-constexpr int kPostFailuresBeforeRebuild = 3;
+// Ceiling for the post-interval backoff applied after an HTTP status
+// failure. A rejected token on a boat can stand for days; this keeps the
+// retry rate low without ever giving up on it.
+constexpr uint32_t kPostBackoffCapMs = 300000;
 
 // Floor for timer periods that arrive over the control WebSocket.
 constexpr uint32_t kMinGattIntervalMs = 100;
@@ -523,6 +525,16 @@ bool BLESignalKGateway::post_pending_advertisements(bool allow_empty) {
     return true;
   }
 
+  // Backing off after an HTTP status failure. Drain anyway rather than
+  // returning early: the buffer's contents are what fragment the heap, and
+  // an advertisement held for minutes is stale presence data by the time
+  // the endpoint starts accepting batches again.
+  if (post_backoff_ms_ > 0 &&
+      static_cast<long>(millis() - post_backoff_until_ms_) < 0) {
+    adv_dropped_count_.fetch_add(to_post.size(), std::memory_order_relaxed);
+    return false;
+  }
+
   // Build the JSON batch.
   JsonDocument doc;
   doc["gateway_id"] = SensESPBaseApp::get_hostname();
@@ -590,7 +602,7 @@ bool BLESignalKGateway::post_pending_advertisements(bool allow_empty) {
       err == ESP_OK ? esp_http_client_get_status_code(post_client_) : -err;
 
   if (code == 200) {
-    post_failure_streak_ = 0;
+    post_backoff_ms_ = 0;
     adv_posted_count_.fetch_add(to_post.size(), std::memory_order_relaxed);
     http_post_success_.fetch_add(1, std::memory_order_relaxed);
     ESP_LOGI(kTag, "POST: forwarded %u adv, heap=%u",
@@ -601,7 +613,17 @@ bool BLESignalKGateway::post_pending_advertisements(bool allow_empty) {
 
   http_post_fail_.fetch_add(1, std::memory_order_relaxed);
   adv_dropped_count_.fetch_add(to_post.size(), std::memory_order_relaxed);
-  ++post_failure_streak_;
+
+  if (err != ESP_OK) {
+    ESP_LOGW(kTag, "POST failed: %s, heap=%u", esp_err_to_name(err),
+             static_cast<unsigned>(ESP.getFreeHeap()));
+    // A kept-alive handle whose socket has died stays dead: esp_http_client
+    // does not reset its state machine after a mid-request failure. Drop it
+    // now rather than spending further intervals, and their timeouts, posting
+    // through a handle that cannot succeed.
+    destroy_post_client();
+    return false;
+  }
 
   if (code == 401 || code == 403) {
     // Deliberately does not restart the Signal K client. That client is
@@ -613,23 +635,23 @@ bool BLESignalKGateway::post_pending_advertisements(bool allow_empty) {
              "POST: auth rejected (HTTP %d); the token is not accepted on "
              "the BLE provider endpoint",
              code);
-  } else if (err != ESP_OK) {
-    ESP_LOGW(kTag, "POST failed: %s, heap=%u", esp_err_to_name(err),
-             static_cast<unsigned>(ESP.getFreeHeap()));
   } else {
     ESP_LOGW(kTag, "POST failed: HTTP %d, heap=%u", code,
              static_cast<unsigned>(ESP.getFreeHeap()));
   }
 
-  // A kept-alive handle whose socket has died stays dead: esp_http_client
-  // does not reset its state machine after a mid-request failure. Drop it
-  // so the next batch dials afresh.
-  if (post_failure_streak_ >= kPostFailuresBeforeRebuild) {
-    ESP_LOGW(kTag, "Rebuilding the delivery connection after %d failures",
-             post_failure_streak_);
-    destroy_post_client();
-    post_failure_streak_ = 0;
+  // The server answered, so the transport is healthy and rebuilding it would
+  // only spend a fresh handshake on a rejection that stands regardless. Slow
+  // the cadence instead.
+  post_backoff_ms_ = post_backoff_ms_ == 0
+                         ? config_.post_interval_ms * 2
+                         : post_backoff_ms_ * 2;
+  if (post_backoff_ms_ > kPostBackoffCapMs) {
+    post_backoff_ms_ = kPostBackoffCapMs;
   }
+  post_backoff_until_ms_ = millis() + post_backoff_ms_;
+  ESP_LOGW(kTag, "POST: next attempt in %u ms",
+           static_cast<unsigned>(post_backoff_ms_));
   return false;
 }
 
