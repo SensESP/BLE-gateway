@@ -229,10 +229,19 @@ void BLESignalKGateway::on_advertisement() {
     adv_dropped_count_.fetch_add(1, std::memory_order_relaxed);
     return;
   }
-  if (pending_ads_.size() >= config_.max_pending_ads) {
+  // Bound by the capacity actually reserved, not only by the configured
+  // maximum. Between a drain and restore_pending_capacity() the array is
+  // reserved for the window rather than the whole buffer, and pushing past
+  // that would reallocate here — on the Bluetooth host's callback, in a
+  // build without exceptions, where a failed allocation aborts the device.
+  // Trimming instead keeps the push non-allocating on every path.
+  const size_t capacity = pending_ads_.capacity() < config_.max_pending_ads
+                              ? pending_ads_.capacity()
+                              : config_.max_pending_ads;
+  if (pending_ads_.size() >= capacity) {
     // Buffer full — drop oldest to keep newest. Cheap approximation:
     // drop the first half so we do not ping-pong on every new ad.
-    const size_t keep = config_.max_pending_ads / 2;
+    const size_t keep = capacity / 2;
     const size_t dropped = pending_ads_.size() - keep;
     pending_ads_.erase(pending_ads_.begin(), pending_ads_.begin() + dropped);
     adv_dropped_count_.fetch_add(dropped, std::memory_order_relaxed);

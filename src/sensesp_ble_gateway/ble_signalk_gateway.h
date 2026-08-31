@@ -89,15 +89,16 @@ struct BLESignalKGatewayConfig {
   ///
   /// This threshold does not scale with max_pending_ads, and tying the
   /// two is a mistake worth naming because it looks reasonable. The
-  /// element array is reserved in the constructor and restored after
-  /// each drain, so outside the short window between a drain and its
-  /// restoration the ingest path does not grow it; what it allocates is
-  /// the copied advertisement's name string and payload vectors, which
-  /// are small and do not depend on how deep the buffer is. Requiring
-  /// the whole array to be free on top of that made a larger buffer
-  /// less willing to accept anything — at max_pending_ads = 500 the
-  /// check asked for around 30 kB contiguous, which an ESP32 running a
-  /// scan never has, so every advertisement was dropped.
+  /// element array is reserved in the constructor, restored after each
+  /// drain, and never grown on the ingest path — a push that would
+  /// exceed the reserved capacity trims the buffer instead. What the
+  /// ingest path allocates is the copied advertisement's name string
+  /// and payload vectors, which are small and do not depend on how
+  /// deep the buffer is. Requiring the whole array to be free on top of
+  /// that made a larger buffer less willing to accept anything — at
+  /// max_pending_ads = 500 the check asked for around 30 kB contiguous,
+  /// which an ESP32 running a scan never has, so every advertisement
+  /// was dropped.
   ///
   /// It is not a handshake reservation either way. A fresh TLS
   /// handshake needed a 32.8 kB contiguous block when measured on an
