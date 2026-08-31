@@ -15,6 +15,23 @@ namespace sensesp {
 namespace {
 constexpr const char* kTag = "ble_gw";
 
+#ifdef BLE_GW_HEAP_TRACE
+// Largest contiguous internal block, which is what a TLS handshake needs and
+// what the advertisement buffer competes with. Free heap alone hides
+// fragmentation, so both are reported.
+void heap_probe(const char* label, size_t batch, size_t pending_capacity) {
+  ESP_LOGW(kTag, "HEAPTRACE %s largest=%u free=%u batch=%u cap=%u", label,
+           (unsigned)heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL |
+                                                      MALLOC_CAP_8BIT),
+           (unsigned)heap_caps_get_free_size(MALLOC_CAP_INTERNAL |
+                                             MALLOC_CAP_8BIT),
+           (unsigned)batch, (unsigned)pending_capacity);
+}
+#define BLE_GW_HEAP_PROBE(label, batch, cap) heap_probe(label, batch, cap)
+#else
+#define BLE_GW_HEAP_PROBE(label, batch, cap) ((void)0)
+#endif
+
 constexpr const char* kAdvertisementsPath =
     "/signalk/v2/api/ble/gateway/advertisements";
 constexpr const char* kControlWsPathPrefix =
@@ -27,6 +44,15 @@ constexpr uint32_t kPostBackoffCapMs = 300000;
 
 // Floor for timer periods that arrive over the control WebSocket.
 constexpr uint32_t kMinGattIntervalMs = 100;
+
+// Capacity handed to the pending buffer for the short window between draining
+// a batch and restoring the full reservation. Without it the buffer sits at
+// zero capacity and the GAP callback grows it from nothing, one doubling at a
+// time, in a build with exceptions disabled. Sized for the window rather than
+// the buffer: at the ~15 advertisements/s a busy anchorage produces and a
+// window measured at 100 ms, this is two orders of magnitude of headroom, and
+// it costs about 2 kB against the ~28 kB a full second array would.
+constexpr size_t kDrainWindowReserve = 32;
 
 // SKWSClient stores the leaf's DNS SANs as a normalized, sorted,
 // comma-joined set. esp-tls verifies against a single name, so bind to
@@ -501,6 +527,17 @@ void BLESignalKGateway::handle_control_ws_message(uint8_t* payload,
   }
 }
 
+void BLESignalKGateway::restore_pending_capacity() {
+  if (xSemaphoreTake(pending_ads_mutex_, pdMS_TO_TICKS(200)) != pdTRUE) {
+    // Next cycle restores it. The buffer still works at zero capacity; it
+    // just regrows in steps until then.
+    return;
+  }
+  pending_ads_.reserve(config_.max_pending_ads);
+  BLE_GW_HEAP_PROBE("capacity.restored", 0, pending_ads_.capacity());
+  xSemaphoreGive(pending_ads_mutex_);
+}
+
 bool BLESignalKGateway::post_pending_advertisements(bool allow_empty) {
   if (!sk_connected_.load()) {
     return false;
@@ -518,17 +555,39 @@ bool BLESignalKGateway::post_pending_advertisements(bool allow_empty) {
   // without the Authorization header.
 
   // Drain the pending buffer under the mutex.
+  BLE_GW_HEAP_PROBE("drain.pre", pending_ads_.size(), pending_ads_.capacity());
+  // Declared before to_post so it destructs after it: the batch's array is
+  // already freed by the time the buffer's is allocated, so only one of the
+  // two is ever live. Covers every return path out of this function.
+  struct CapacityRestorer {
+    BLESignalKGateway* self;
+    ~CapacityRestorer() { self->restore_pending_capacity(); }
+  } capacity_restorer{this};
+
   std::vector<BLEAdvertisement> to_post;
   if (xSemaphoreTake(pending_ads_mutex_, pdMS_TO_TICKS(200)) != pdTRUE) {
     return false;
   }
   to_post.swap(pending_ads_);
-  // swap() hands the reserved buffer to to_post, so without this the
-  // vector regrows from zero on the Bluetooth callback every cycle --
-  // a steady source of the fragmentation the delivery connection is
-  // held open to survive.
-  pending_ads_.reserve(config_.max_pending_ads);
+  // Enough capacity to absorb the advertisements that arrive before the full
+  // reservation is restored, so the GAP callback does not have to grow the
+  // element array. Each buffered advertisement still allocates its own name
+  // string and payload vector there, as it always has; only the array is
+  // covered here.
+  pending_ads_.reserve(config_.max_pending_ads < kDrainWindowReserve
+                           ? config_.max_pending_ads
+                           : kDrainWindowReserve);
+  BLE_GW_HEAP_PROBE("drain.swapped", to_post.size(), pending_ads_.capacity());
   xSemaphoreGive(pending_ads_mutex_);
+  // The full reservation is deliberately deferred until the batch has been
+  // serialized and freed; restore_pending_capacity() below does that. Taking it
+  // here instead would hold two full element arrays at once, and at the default
+  // max_pending_ads that is two ~28 kB blocks on a heap that has around 8 kB
+  // contiguous once a scan is running. The allocation then throws with
+  // exceptions disabled, which is an abort() and a reboot loop.
+
+  // Counted once here so the accounting survives releasing the batch.
+  const size_t batch_size = to_post.size();
 
   if (to_post.empty() && !allow_empty) {
     return true;
@@ -540,7 +599,7 @@ bool BLESignalKGateway::post_pending_advertisements(bool allow_empty) {
   // the endpoint starts accepting batches again.
   if (post_backoff_ms_ > 0 &&
       static_cast<long>(millis() - post_backoff_until_ms_) < 0) {
-    adv_dropped_count_.fetch_add(to_post.size(), std::memory_order_relaxed);
+    adv_dropped_count_.fetch_add(batch_size, std::memory_order_relaxed);
     return false;
   }
 
@@ -574,13 +633,23 @@ bool BLESignalKGateway::post_pending_advertisements(bool allow_empty) {
 
   String body;
   serializeJson(doc, body);
+  BLE_GW_HEAP_PROBE("body.built", batch_size, pending_ads_.capacity());
+
+  // The batch is serialized into body and nothing downstream reads it, so
+  // release it and restore the reservation now rather than at function exit.
+  // That returns the element array, its strings and its payload vectors before
+  // the POST needs buffers of its own, and it ends the reduced-capacity window
+  // here instead of after a POST that can take seconds. The guard above still
+  // covers the early returns that never reach this point.
+  { std::vector<BLEAdvertisement>().swap(to_post); }
+  restore_pending_capacity();
 
   String ca_pem;
   String common_name;
   const Transport transport = resolve_transport(ca_pem, common_name);
   if (transport == Transport::kUnavailable) {
     http_post_fail_.fetch_add(1, std::memory_order_relaxed);
-    adv_dropped_count_.fetch_add(to_post.size(), std::memory_order_relaxed);
+    adv_dropped_count_.fetch_add(batch_size, std::memory_order_relaxed);
     return false;
   }
   const bool use_tls = transport == Transport::kTls;
@@ -590,7 +659,7 @@ bool BLESignalKGateway::post_pending_advertisements(bool allow_empty) {
 
   if (!ensure_post_client(url, ca_pem, common_name)) {
     http_post_fail_.fetch_add(1, std::memory_order_relaxed);
-    adv_dropped_count_.fetch_add(to_post.size(), std::memory_order_relaxed);
+    adv_dropped_count_.fetch_add(batch_size, std::memory_order_relaxed);
     return false;
   }
 
@@ -612,16 +681,16 @@ bool BLESignalKGateway::post_pending_advertisements(bool allow_empty) {
 
   if (code == 200) {
     post_backoff_ms_ = 0;
-    adv_posted_count_.fetch_add(to_post.size(), std::memory_order_relaxed);
+    adv_posted_count_.fetch_add(batch_size, std::memory_order_relaxed);
     http_post_success_.fetch_add(1, std::memory_order_relaxed);
     ESP_LOGI(kTag, "POST: forwarded %u adv, heap=%u",
-             static_cast<unsigned>(to_post.size()),
+             static_cast<unsigned>(batch_size),
              static_cast<unsigned>(ESP.getFreeHeap()));
     return true;
   }
 
   http_post_fail_.fetch_add(1, std::memory_order_relaxed);
-  adv_dropped_count_.fetch_add(to_post.size(), std::memory_order_relaxed);
+  adv_dropped_count_.fetch_add(batch_size, std::memory_order_relaxed);
 
   if (err != ESP_OK) {
     ESP_LOGW(kTag, "POST failed: %s, heap=%u", esp_err_to_name(err),
