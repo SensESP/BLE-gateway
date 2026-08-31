@@ -362,10 +362,14 @@ class BLESignalKGateway {
   // permanent condition is not logged every post interval.
   mutable std::atomic<bool> tls_unavailable_logged_{false};
 
-  // Consecutive failed POST attempts. A kept-alive connection that the
-  // server or the network has killed cannot recover on its own, so the
-  // client is rebuilt once the streak crosses a threshold.
-  int post_failure_streak_ = 0;
+  // Backoff after an HTTP status failure. Zero when the last POST
+  // succeeded. A rejection the server keeps repeating -- a stale token,
+  // a provider plugin that is not installed -- is not a transport fault
+  // and neither retrying it every interval nor rebuilding the connection
+  // makes it go away, so the cadence backs off instead. Doubles per
+  // failure to kPostBackoffCapMs and resets on the first 200.
+  uint32_t post_backoff_ms_ = 0;
+  unsigned long post_backoff_until_ms_ = 0;
 
   // Background POST task handle. post_task_exited_ lets stop() wait for
   // the task to leave the loop before the object's state is torn down;
