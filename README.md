@@ -22,11 +22,11 @@ when it was pinned, rather than running a second trust-on-first-use exchange of
 their own. Without that name check a pinned CA would authorize any certificate
 it ever signed.
 
-Two cases leave the gateway's channels disabled rather than sending the Signal K
-token to a server they cannot verify: nothing pinned yet, and a server whose
+Three cases leave the gateway's channels disabled rather than sending the Signal
+K token to a server they cannot verify: nothing pinned yet, a server whose
 certificate arrives without its issuing CA, where `SKWSClient` pins a leaf
-fingerprint that these clients cannot express. Both are reported once at error
-level.
+fingerprint that these clients cannot express, and a pinned CA stored without the
+name that binds it. Each is reported once at error level.
 
 The advertisement connection is opened once, before the scanner starts, and held
 open. That ordering is deliberate: a TLS handshake needs a contiguous

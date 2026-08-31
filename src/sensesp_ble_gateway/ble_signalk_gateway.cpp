@@ -250,8 +250,21 @@ BLESignalKGateway::Transport BLESignalKGateway::resolve_transport(
     return Transport::kUnavailable;
   }
 
+  const String san = first_san(sk_client_->get_tofu_san());
+  if (san.length() == 0) {
+    if (!tls_unavailable_logged_.exchange(true)) {
+      ESP_LOGE(kTag,
+               "SSL is on and a CA is pinned, but no leaf identity was stored "
+               "with it, so there is no name to bind the certificate to and "
+               "the CA would authorize any leaf it ever signed. The gateway's "
+               "own channels stay disabled. Reset the pinned trust anchor on "
+               "a trusted network to re-pin both.");
+    }
+    return Transport::kUnavailable;
+  }
+
   ca_pem = sk_client_->get_tofu_ca();
-  common_name = first_san(sk_client_->get_tofu_san());
+  common_name = san;
   return Transport::kTls;
 }
 
@@ -289,11 +302,11 @@ bool BLESignalKGateway::ensure_post_client(const String& url,
   cfg.disable_auto_redirect = true;
   if (post_ca_pem_.length() > 0) {
     cfg.cert_pem = post_ca_pem_.c_str();
-    if (post_cn_.length() > 0) {
-      cfg.common_name = post_cn_.c_str();
-    } else {
-      cfg.skip_cert_common_name_check = true;
-    }
+    // resolve_transport() reports kUnavailable rather than hand out a CA with
+    // no identity to bind it to, so the name check is never skipped here.
+    // Without it the pinned CA would authorize any leaf it ever signed, and
+    // the POST URL is built from an mDNS name anyone on the LAN can answer for.
+    cfg.common_name = post_cn_.c_str();
   }
 
   post_client_ = esp_http_client_init(&cfg);
@@ -351,15 +364,11 @@ void BLESignalKGateway::init_control_ws() {
   cfg.buffer_size = 1024;
   if (use_tls) {
     cfg.cert_pem = control_ws_ca_pem_.c_str();
-    if (control_ws_cn_.length() > 0) {
-      // The device dials the server by address, so the name on the
-      // certificate is checked against the identity pinned at first use
-      // rather than against the address. Without this the pinned CA
-      // would authorize any leaf it ever signed.
-      cfg.cert_common_name = control_ws_cn_.c_str();
-    } else {
-      cfg.skip_cert_common_name_check = true;
-    }
+    // The device dials the server by address, so the name on the certificate
+    // is checked against the identity pinned at first use rather than against
+    // the address. Without this the pinned CA would authorize any leaf it
+    // ever signed. resolve_transport() guarantees the name is present.
+    cfg.cert_common_name = control_ws_cn_.c_str();
   }
   // reconnect_timeout_ms and network_timeout_ms are only available
   // in the IDF component version of esp_websocket_client, not in the
