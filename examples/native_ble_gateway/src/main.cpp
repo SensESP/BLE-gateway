@@ -71,4 +71,9 @@ void setup() {
   });
 }
 
-void loop() { event_loop()->tick(); }
+void loop() {
+  event_loop()->tick();
+  // tick() returns immediately when no event is due, so a bare loop
+  // never lets the idle task on this core feed the task watchdog.
+  delay(1);
+}
