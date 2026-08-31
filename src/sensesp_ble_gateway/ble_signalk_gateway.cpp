@@ -569,15 +569,18 @@ bool BLESignalKGateway::post_pending_advertisements(bool allow_empty) {
     return false;
   }
   to_post.swap(pending_ads_);
-  // Small interim capacity so advertisements arriving before the full
-  // reservation is restored do not have to allocate from the GAP callback.
+  // Enough capacity to absorb the advertisements that arrive before the full
+  // reservation is restored, so the GAP callback does not have to grow the
+  // element array. Each buffered advertisement still allocates its own name
+  // string and payload vector there, as it always has; only the array is
+  // covered here.
   pending_ads_.reserve(config_.max_pending_ads < kDrainWindowReserve
                            ? config_.max_pending_ads
                            : kDrainWindowReserve);
   BLE_GW_HEAP_PROBE("drain.swapped", to_post.size(), pending_ads_.capacity());
   xSemaphoreGive(pending_ads_mutex_);
-  // The buffer is deliberately left at zero capacity until the batch has been
-  // serialized and freed; restore_pending_capacity() below does that. Reserving
+  // The full reservation is deliberately deferred until the batch has been
+  // serialized and freed; restore_pending_capacity() below does that. Taking it
   // here instead would hold two full element arrays at once, and at the default
   // max_pending_ads that is two ~28 kB blocks on a heap that has around 8 kB
   // contiguous once a scan is running. The allocation then throws with
