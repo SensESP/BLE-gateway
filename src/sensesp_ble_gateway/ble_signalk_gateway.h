@@ -252,6 +252,12 @@ class BLESignalKGateway {
    */
   bool post_pending_advertisements(bool allow_empty = false);
 
+  /// @brief Re-reserve the pending buffer after a batch has been drained and
+  /// freed. Kept separate from the drain so the two element arrays are never
+  /// alive at the same time; at the default max_pending_ads that would need
+  /// two ~28 kB contiguous blocks, which an ESP32 running a scan cannot give.
+  void restore_pending_capacity();
+
   // FreeRTOS task that runs post_pending_advertisements() on a
   // timer. Started in start(), stopped in stop().
   static void post_task_entry(void* arg);
