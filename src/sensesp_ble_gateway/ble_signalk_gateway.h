@@ -73,8 +73,21 @@ struct BLESignalKGatewayConfig {
   /// declines work when memory is already low. It neither reserves the
   /// memory nor rules out a failure between the check and the
   /// allocation, so it lowers the odds of an abort rather than removing
-  /// them. The headroom also leaves room for a TLS handshake, which
-  /// needs a contiguous block of its own.
+  /// them.
+  ///
+  /// This field is a floor, not the threshold. required_free_block()
+  /// returns the larger of it and the buffer's own growth step,
+  /// max_pending_ads * sizeof(BLEAdvertisement), and at the default 500
+  /// that growth term is around 30 kB — so the effective check is
+  /// several times this number. Worth knowing before tuning either
+  /// field, because raising max_pending_ads raises the bar for
+  /// buffering anything at all.
+  ///
+  /// It is not a handshake reservation either way. A fresh TLS
+  /// handshake needed a 32.8 kB contiguous block when measured on an
+  /// ESP32, and nothing here reserves that; the connection is opened
+  /// before scanning starts precisely because it cannot be obtained
+  /// afterwards.
   ///
   /// Measured against internal RAM specifically: PSRAM is byte
   /// addressable and would otherwise mask the shortage on the boards
@@ -162,8 +175,9 @@ class BLESignalKGateway {
    * connection first and starts the scan once it is established, or
    * after roughly twenty seconds if it cannot be. Over TLS that
    * ordering is what makes the connection possible at all: the
-   * handshake needs a contiguous few kilobytes and a running scan
-   * fragments the heap within seconds.
+   * handshake needs a contiguous block of tens of kilobytes, and the
+   * advertisements the scan produces fragment the heap within seconds
+   * of being buffered.
    *
    * Safe to call once; subsequent calls are no-ops.
    */
@@ -293,10 +307,11 @@ class BLESignalKGateway {
    *
    * The client is kept alive between batches instead of being built and
    * torn down around each one. Over TLS that matters a great deal: a
-   * handshake needs a contiguous few kilobytes, and once the scanner is
-   * running the heap is too fragmented to supply them on demand, so a
-   * client that reconnects every batch never connects at all. Holding
-   * one connection open means the cost is paid once.
+   * handshake needs a contiguous block of tens of kilobytes, and once
+   * advertisements are being buffered the heap is too fragmented to
+   * supply one on demand, so a client that reconnects every batch never
+   * connects at all. Holding one connection open means the cost is paid
+   * once, while the heap is still clean.
    *
    * Rebuilds the client if the URL or the CA has changed since it was
    * created; otherwise reuses it as is.

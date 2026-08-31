@@ -14,14 +14,21 @@ jobs:
         include:
           - example: native_ble_gateway
             env: esp32_ble_gateway
+            tls_pins: CONFIG_MBEDTLS_DYNAMIC_BUFFER=n CONFIG_MBEDTLS_SSL_IN_CONTENT_LEN=16384
           - example: native_ble_gateway
             env: esp32s3_ble_gateway
+            tls_pins: CONFIG_MBEDTLS_DYNAMIC_BUFFER=n CONFIG_MBEDTLS_SSL_IN_CONTENT_LEN=16384
           - example: native_ble_gateway
             env: esp32c3_ble_gateway
+            tls_pins: CONFIG_MBEDTLS_DYNAMIC_BUFFER=n CONFIG_MBEDTLS_SSL_IN_CONTENT_LEN=16384
           - example: p4_ble_gateway
             env: p4_ble_gateway
+            tls_pins: CONFIG_MBEDTLS_DYNAMIC_BUFFER=n CONFIG_MBEDTLS_SSL_IN_CONTENT_LEN=16384
+          # The C5 allocates mbedTLS from PSRAM, so the record-buffer size is
+          # not load-bearing there; the dynamic-buffer pin still is.
           - example: c5_ble_gateway
             env: c5_ble_gateway
+            tls_pins: CONFIG_MBEDTLS_DYNAMIC_BUFFER=n
     steps:
       - uses: actions/checkout@v7
 
@@ -45,3 +52,34 @@ jobs:
 
       - name: Build ${{ matrix.env }}
         run: pio run -d examples/${{ matrix.example }} -e ${{ matrix.env }}
+
+      - name: Assert the required TLS settings are pinned and survive resolution
+        run: |
+          DEFAULTS="examples/${{ matrix.example }}/sdkconfig.defaults"
+          RESOLVED="examples/${{ matrix.example }}/sdkconfig.${{ matrix.env }}"
+          test -f "$RESOLVED" || { echo "::error::no generated sdkconfig at $RESOLVED"; exit 1; }
+
+          # The required list is defined here rather than read out of
+          # sdkconfig.defaults, so deleting a pin from that file fails the build
+          # instead of quietly removing its own check.
+          rc=0
+          for pin in ${{ matrix.tls_pins }}; do
+            key="${pin%%=*}"
+            value="${pin#*=}"
+            if [ "$value" = "n" ]; then resolved_form="# $key is not set"; else resolved_form="$pin"; fi
+
+            grep -qxF "$pin" "$DEFAULTS" \
+              || { echo "::error::$DEFAULTS no longer pins $pin"; rc=1; }
+            grep -qxF "$resolved_form" "$RESOLVED" \
+              || { echo "::error::$RESOLVED does not carry '$resolved_form'"; rc=1; }
+            echo "ok: $pin"
+          done
+
+          # Anything else the example pins in the same namespaces must also
+          # survive resolution, so an override of a pre-existing value is caught.
+          while IFS='=' read -r key value; do
+            if [ "$value" = "n" ]; then expected="# $key is not set"; else expected="$key=$value"; fi
+            grep -qxF "$expected" "$RESOLVED" \
+              || { echo "::error::$DEFAULTS pins '$key=$value' but $RESOLVED lacks '$expected'"; rc=1; }
+          done < <(grep -E '^CONFIG_(MBEDTLS|ESP_TLS)_' "$DEFAULTS")
+          exit $rc

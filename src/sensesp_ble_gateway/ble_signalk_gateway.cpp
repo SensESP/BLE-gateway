@@ -1084,8 +1084,8 @@ void BLESignalKGateway::post_task_entry(void* arg) {
 
 void BLESignalKGateway::post_task_loop() {
   // Open the delivery connection before the scanner runs. Over TLS the
-  // handshake needs a contiguous few kilobytes, and the advertisement
-  // flood fragments the heap within seconds of scanning, so a client
+  // handshake needs a contiguous block of tens of kilobytes, and the
+  // advertisement flood fragments the heap within seconds, so a client
   // that first connects afterwards may never connect at all. Priming it
   // here costs one empty batch and, with keep-alive, holds for the life
   // of the device.

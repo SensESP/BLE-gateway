@@ -120,3 +120,10 @@ CONFIG_MBEDTLS_PSK_MODES=y
 CONFIG_MBEDTLS_KEY_EXCHANGE_PSK=y
 CONFIG_HTTPD_MAX_REQ_HDR_LEN=1024
 CONFIG_ESP_TASK_WDT_CHECK_IDLE_TASK_CPU1=n
+
+# TLS record buffers. This target has PSRAM but does not set
+# CONFIG_MBEDTLS_EXTERNAL_MEM_ALLOC, so mbedTLS allocates from internal RAM as
+# it does on the ESP32, and the same reasoning applies — see the comments in
+# examples/native_ble_gateway/sdkconfig.defaults.
+CONFIG_MBEDTLS_DYNAMIC_BUFFER=n
+CONFIG_MBEDTLS_SSL_IN_CONTENT_LEN=16384
