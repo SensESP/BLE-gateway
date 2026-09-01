@@ -379,11 +379,13 @@ void BLESignalKGateway::init_control_ws() {
     return;
   }
 
-  // Tear down any previous instance first.
+  // Create if absent. Both callers mean "make sure it exists", and rebuilding a
+  // live client would drop a working control channel and pay for a second TLS
+  // handshake to replace it. Tested here rather than at the call sites so two
+  // callers racing cannot both build one; destroy_control_ws() owns teardown.
   if (control_ws_ != nullptr) {
-    esp_websocket_client_stop(control_ws_);
-    esp_websocket_client_destroy(control_ws_);
-    control_ws_ = nullptr;
+    xSemaphoreGive(control_ws_mutex_);
+    return;
   }
 
   String token = sk_client_->get_auth_token();
