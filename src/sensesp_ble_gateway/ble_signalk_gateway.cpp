@@ -15,6 +15,14 @@ namespace sensesp {
 namespace {
 constexpr const char* kTag = "ble_gw";
 
+// Arduino's ESP.getFreeHeap() asks for MALLOC_CAP_INTERNAL without
+// MALLOC_CAP_8BIT, so it counts the IRAM-only region — about 31 kB on an
+// ESP32 — which is 32-bit-access-only and can never hold a buffer. Report what
+// an allocation can actually come from.
+uint32_t usable_free_heap() {
+  return heap_caps_get_free_size(MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT);
+}
+
 #ifdef BLE_GW_HEAP_TRACE
 // Largest contiguous internal block, which is what a TLS handshake needs and
 // what the advertisement buffer competes with. Free heap alone hides
@@ -120,31 +128,16 @@ void BLESignalKGateway::start() {
   // via get() and buffers into pending_ads_ for the HTTP POST task.
   ble_provisioner_->attach([this]() { this->on_advertisement(); });
 
-  // Hook the SK connection state producer. SKWSClient inherits from
-  // ValueProducer<SKWSConnectionState> so we can connect_to() it
-  // directly. When SK connects we want to (re)start the control WS;
-  // when it disconnects we want to tear it down so it does not keep
-  // trying to reach a dead server.
-  sk_client_->connect_to(
-      new LambdaConsumer<SKWSConnectionState>([this](SKWSConnectionState s) {
-        bool connected = (s == SKWSConnectionState::kSKWSConnected);
-        sk_connected_.store(connected);
-        if (config_.enable_control_ws && connected && control_ws_ == nullptr) {
-          ESP_LOGI(kTag,
-                   "SK main WS connected — starting BLE gateway control WS");
-          init_control_ws();
-        }
-      }));
-
-  // connect_to() attaches without replaying the current value, so seed
+  // connect_to() below attaches without replaying the current value, so seed
   // the state directly. Independent of the control WS: with it disabled,
   // a gateway started while SK is already up would otherwise never post.
   sk_connected_.store(sk_client_->is_connected());
-  if (config_.enable_control_ws && sk_connected_.load()) {
-    init_control_ws();
-  }
 
-  // Start background POST task.
+  // The POST task before the control WebSocket, deliberately. Its stack is one
+  // 8 kB contiguous allocation and delivery is what the gateway is for, while
+  // the control WebSocket is optional and costs a whole TLS session. Started
+  // the other way round on a device where Signal K is already connected, the
+  // control channel takes the memory and task creation fails.
   post_task_should_run_.store(true);
   post_task_exited_.store(false);
   if (xTaskCreate(&BLESignalKGateway::post_task_entry, "ble_gw_post", 8192,
@@ -161,6 +154,29 @@ void BLESignalKGateway::start() {
       ble_provisioner_->start_scan();
     }
     return;
+  }
+
+  // Hook the SK connection state producer. SKWSClient inherits from
+  // ValueProducer<SKWSConnectionState> so we can connect_to() it
+  // directly. When SK connects we want to (re)start the control WS;
+  // when it disconnects we want to tear it down so it does not keep
+  // trying to reach a dead server.
+  sk_client_->connect_to(
+      new LambdaConsumer<SKWSConnectionState>([this](SKWSConnectionState s) {
+        bool connected = (s == SKWSConnectionState::kSKWSConnected);
+        sk_connected_.store(connected);
+        if (config_.enable_control_ws && connected && control_ws_ == nullptr) {
+          ESP_LOGI(kTag,
+                   "SK main WS connected — starting BLE gateway control WS");
+          init_control_ws();
+        }
+      }));
+  // Re-seed after attaching: the POST task is already running by now, and a
+  // connection that completed between the first seed and this attach would
+  // otherwise leave it waiting on a state nobody will publish again.
+  sk_connected_.store(sk_client_->is_connected());
+  if (config_.enable_control_ws && sk_connected_.load()) {
+    init_control_ws();
   }
 
   // Scanning is started by the POST task, not here — see
@@ -363,11 +379,13 @@ void BLESignalKGateway::init_control_ws() {
     return;
   }
 
-  // Tear down any previous instance first.
+  // Create if absent. Both callers mean "make sure it exists", and rebuilding a
+  // live client would drop a working control channel and pay for a second TLS
+  // handshake to replace it. Tested here rather than at the call sites so two
+  // callers racing cannot both build one; destroy_control_ws() owns teardown.
   if (control_ws_ != nullptr) {
-    esp_websocket_client_stop(control_ws_);
-    esp_websocket_client_destroy(control_ws_);
-    control_ws_ = nullptr;
+    xSemaphoreGive(control_ws_mutex_);
+    return;
   }
 
   String token = sk_client_->get_auth_token();
@@ -423,10 +441,21 @@ void BLESignalKGateway::init_control_ws() {
     return;
   }
 
-  esp_websocket_register_events(control_ws_, WEBSOCKET_EVENT_ANY,
-                                &BLESignalKGateway::control_ws_event_trampoline,
-                                this);
-  esp_websocket_client_start(control_ws_);
+  esp_err_t err = esp_websocket_register_events(
+      control_ws_, WEBSOCKET_EVENT_ANY,
+      &BLESignalKGateway::control_ws_event_trampoline, this);
+  if (err == ESP_OK) {
+    err = esp_websocket_client_start(control_ws_);
+  }
+  if (err != ESP_OK) {
+    // Keeping a client that never started would make the failure permanent:
+    // the create-if-absent test above sees a non-null handle, and nothing
+    // rebuilds it. Starting allocates a task, so this fails exactly when the
+    // device is short of memory and the next attempt matters most.
+    ESP_LOGE(kTag, "control WS start failed: %s", esp_err_to_name(err));
+    esp_websocket_client_destroy(control_ws_);
+    control_ws_ = nullptr;
+  }
 
   xSemaphoreGive(control_ws_mutex_);
 }
@@ -496,7 +525,7 @@ void BLESignalKGateway::send_status() {
   doc["type"] = "status";
   doc["gateway_id"] = SensESPBaseApp::get_hostname();
   doc["uptime"] = millis() / 1000;
-  doc["free_heap"] = ESP.getFreeHeap();
+  doc["free_heap"] = usable_free_heap();
   doc["active_gatt_connections"] =
       ble_provisioner_ ? ble_provisioner_->active_gatt_connections() : 0;
   doc["max_gatt_connections"] =
@@ -621,7 +650,7 @@ bool BLESignalKGateway::post_pending_advertisements(bool allow_empty) {
                         ? config_.firmware_version
                         : String(kSensESPVersion);
   doc["uptime"] = millis() / 1000;
-  doc["free_heap"] = ESP.getFreeHeap();
+  doc["free_heap"] = usable_free_heap();
   if (ble_provisioner_) {
     String mac = ble_provisioner_->mac_address();
     if (mac.length() > 0) {
@@ -695,7 +724,7 @@ bool BLESignalKGateway::post_pending_advertisements(bool allow_empty) {
     http_post_success_.fetch_add(1, std::memory_order_relaxed);
     ESP_LOGI(kTag, "POST: forwarded %u adv, heap=%u",
              static_cast<unsigned>(batch_size),
-             static_cast<unsigned>(ESP.getFreeHeap()));
+             static_cast<unsigned>(usable_free_heap()));
     return true;
   }
 
@@ -704,7 +733,7 @@ bool BLESignalKGateway::post_pending_advertisements(bool allow_empty) {
 
   if (err != ESP_OK) {
     ESP_LOGW(kTag, "POST failed: %s, heap=%u", esp_err_to_name(err),
-             static_cast<unsigned>(ESP.getFreeHeap()));
+             static_cast<unsigned>(usable_free_heap()));
     // A kept-alive handle whose socket has died stays dead: esp_http_client
     // does not reset its state machine after a mid-request failure. Drop it
     // now rather than spending further intervals, and their timeouts, posting
@@ -725,7 +754,7 @@ bool BLESignalKGateway::post_pending_advertisements(bool allow_empty) {
              code);
   } else {
     ESP_LOGW(kTag, "POST failed: HTTP %d, heap=%u", code,
-             static_cast<unsigned>(ESP.getFreeHeap()));
+             static_cast<unsigned>(usable_free_heap()));
   }
 
   // The server answered, so the transport is healthy and rebuilding it would
