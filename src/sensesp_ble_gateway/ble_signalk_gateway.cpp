@@ -676,7 +676,7 @@ bool BLESignalKGateway::post_pending_advertisements(bool allow_empty) {
     }
 
     serializeJson(doc, body);
-    BLE_GW_HEAP_PROBE("doc.live", batch_size, body.length());
+    BLE_GW_HEAP_PROBE("doc.live", batch_size, pending_ads_.capacity());
   }
   BLE_GW_HEAP_PROBE("body.built", batch_size, pending_ads_.capacity());
 
