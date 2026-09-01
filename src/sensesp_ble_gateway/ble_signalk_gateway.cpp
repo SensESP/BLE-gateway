@@ -128,31 +128,16 @@ void BLESignalKGateway::start() {
   // via get() and buffers into pending_ads_ for the HTTP POST task.
   ble_provisioner_->attach([this]() { this->on_advertisement(); });
 
-  // Hook the SK connection state producer. SKWSClient inherits from
-  // ValueProducer<SKWSConnectionState> so we can connect_to() it
-  // directly. When SK connects we want to (re)start the control WS;
-  // when it disconnects we want to tear it down so it does not keep
-  // trying to reach a dead server.
-  sk_client_->connect_to(
-      new LambdaConsumer<SKWSConnectionState>([this](SKWSConnectionState s) {
-        bool connected = (s == SKWSConnectionState::kSKWSConnected);
-        sk_connected_.store(connected);
-        if (config_.enable_control_ws && connected && control_ws_ == nullptr) {
-          ESP_LOGI(kTag,
-                   "SK main WS connected — starting BLE gateway control WS");
-          init_control_ws();
-        }
-      }));
-
-  // connect_to() attaches without replaying the current value, so seed
+  // connect_to() below attaches without replaying the current value, so seed
   // the state directly. Independent of the control WS: with it disabled,
   // a gateway started while SK is already up would otherwise never post.
   sk_connected_.store(sk_client_->is_connected());
-  if (config_.enable_control_ws && sk_connected_.load()) {
-    init_control_ws();
-  }
 
-  // Start background POST task.
+  // The POST task before the control WebSocket, deliberately. Its stack is one
+  // 8 kB contiguous allocation and delivery is what the gateway is for, while
+  // the control WebSocket is optional and costs a whole TLS session. Started
+  // the other way round on a device where Signal K is already connected, the
+  // control channel takes the memory and task creation fails.
   post_task_should_run_.store(true);
   post_task_exited_.store(false);
   if (xTaskCreate(&BLESignalKGateway::post_task_entry, "ble_gw_post", 8192,
@@ -169,6 +154,29 @@ void BLESignalKGateway::start() {
       ble_provisioner_->start_scan();
     }
     return;
+  }
+
+  // Hook the SK connection state producer. SKWSClient inherits from
+  // ValueProducer<SKWSConnectionState> so we can connect_to() it
+  // directly. When SK connects we want to (re)start the control WS;
+  // when it disconnects we want to tear it down so it does not keep
+  // trying to reach a dead server.
+  sk_client_->connect_to(
+      new LambdaConsumer<SKWSConnectionState>([this](SKWSConnectionState s) {
+        bool connected = (s == SKWSConnectionState::kSKWSConnected);
+        sk_connected_.store(connected);
+        if (config_.enable_control_ws && connected && control_ws_ == nullptr) {
+          ESP_LOGI(kTag,
+                   "SK main WS connected — starting BLE gateway control WS");
+          init_control_ws();
+        }
+      }));
+  // Re-seed after attaching: the POST task is already running by now, and a
+  // connection that completed between the first seed and this attach would
+  // otherwise leave it waiting on a state nobody will publish again.
+  sk_connected_.store(sk_client_->is_connected());
+  if (config_.enable_control_ws && sk_connected_.load()) {
+    init_control_ws();
   }
 
   // Scanning is started by the POST task, not here — see
