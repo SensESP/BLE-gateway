@@ -51,7 +51,7 @@ constexpr uint32_t kMinGattIntervalMs = 100;
 // time, in a build with exceptions disabled. Sized for the window rather than
 // the buffer: at the ~15 advertisements/s a busy anchorage produces and a
 // window measured at 100 ms, this is two orders of magnitude of headroom, and
-// it costs about 2 kB against the ~28 kB a full second array would.
+// it costs about 2 kB against the full array a second reservation would take.
 constexpr size_t kDrainWindowReserve = 32;
 
 // SKWSClient stores the leaf's DNS SANs as a normalized, sorted,
@@ -216,7 +216,16 @@ void BLESignalKGateway::on_advertisement() {
 
   if (heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL |
                                       MALLOC_CAP_8BIT) <
-      required_free_block()) {
+      config_.min_largest_free_block) {
+    adv_dropped_count_.fetch_add(1, std::memory_order_relaxed);
+    return;
+  }
+
+  // A zero-length buffer means buffer nothing, and saying so here is what
+  // makes it mean that. Falling through would let the first push allocate
+  // the element array on this callback, after which the buffer would behave
+  // as if it held one.
+  if (config_.max_pending_ads == 0) {
     adv_dropped_count_.fetch_add(1, std::memory_order_relaxed);
     return;
   }
@@ -229,26 +238,27 @@ void BLESignalKGateway::on_advertisement() {
     adv_dropped_count_.fetch_add(1, std::memory_order_relaxed);
     return;
   }
-  if (pending_ads_.size() >= config_.max_pending_ads) {
+  // Bound by the capacity actually reserved, not only by the configured
+  // maximum. Between a drain and restore_pending_capacity() the array is
+  // reserved for the window rather than the whole buffer, and pushing past
+  // that would reallocate here — on the Bluetooth host's callback, in a
+  // build without exceptions, where a failed allocation aborts the device.
+  // Trimming instead keeps the element array off this callback's allocation
+  // path. The copy itself still allocates the advertisement's name string
+  // and payload vectors, as it always has; only the array is covered here.
+  const size_t capacity = pending_ads_.capacity() < config_.max_pending_ads
+                              ? pending_ads_.capacity()
+                              : config_.max_pending_ads;
+  if (pending_ads_.size() >= capacity) {
     // Buffer full — drop oldest to keep newest. Cheap approximation:
     // drop the first half so we do not ping-pong on every new ad.
-    const size_t keep = config_.max_pending_ads / 2;
+    const size_t keep = capacity / 2;
     const size_t dropped = pending_ads_.size() - keep;
     pending_ads_.erase(pending_ads_.begin(), pending_ads_.begin() + dropped);
     adv_dropped_count_.fetch_add(dropped, std::memory_order_relaxed);
   }
   pending_ads_.push_back(ad);
   xSemaphoreGive(pending_ads_mutex_);
-}
-
-size_t BLESignalKGateway::required_free_block() const {
-  // Buffering one advertisement costs a copy of the struct plus its
-  // strings and payload vector. The configured floor is the baseline;
-  // a large buffer needs room for its own growth step on top.
-  const size_t growth = config_.max_pending_ads * sizeof(BLEAdvertisement);
-  return config_.min_largest_free_block > growth
-             ? config_.min_largest_free_block
-             : growth;
 }
 
 BLESignalKGateway::Transport BLESignalKGateway::resolve_transport(
@@ -581,10 +591,10 @@ bool BLESignalKGateway::post_pending_advertisements(bool allow_empty) {
   xSemaphoreGive(pending_ads_mutex_);
   // The full reservation is deliberately deferred until the batch has been
   // serialized and freed; restore_pending_capacity() below does that. Taking it
-  // here instead would hold two full element arrays at once, and at the default
-  // max_pending_ads that is two ~28 kB blocks on a heap that has around 8 kB
-  // contiguous once a scan is running. The allocation then throws with
-  // exceptions disabled, which is an abort() and a reboot loop.
+  // here instead would hold two full element arrays at once, two contiguous
+  // blocks of max_pending_ads * sizeof(BLEAdvertisement) on a heap that has
+  // around 8 kB contiguous once a scan is running. The allocation then throws
+  // with exceptions disabled, which is an abort() and a reboot loop.
 
   // Counted once here so the accounting survives releasing the batch.
   const size_t batch_size = to_post.size();

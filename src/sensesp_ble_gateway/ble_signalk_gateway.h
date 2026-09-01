@@ -43,8 +43,20 @@ struct BLESignalKGatewayConfig {
   /// Max pending advertisements buffered between POST flushes.
   /// If more arrive than this before the next flush, the buffer
   /// is drained to drop_oldest_keep_newest to avoid unbounded
-  /// memory growth. Default 500.
-  size_t max_pending_ads = 500;
+  /// memory growth. Default 50.
+  ///
+  /// The element array is reserved up front, so this is a standing
+  /// commitment rather than a ceiling that is only reached under load:
+  /// the array alone is this many times sizeof(BLEAdvertisement), and
+  /// each buffered advertisement adds its own name string and payload
+  /// vectors on top. At 50 that is a few kilobytes; at 500 it is more
+  /// internal RAM than an ESP32 has free once WiFi, Bluedroid and one
+  /// TLS session have taken their share.
+  ///
+  /// Buffering deeper than one POST interval is rarely useful either.
+  /// Presence data ages: an advertisement held for half a minute
+  /// describes where a sensor was, not where it is.
+  size_t max_pending_ads = 50;
 
   /// Gateway firmware version string sent in the hello message.
   /// Empty string means use the SensESP library version.
@@ -75,13 +87,18 @@ struct BLESignalKGatewayConfig {
   /// allocation, so it lowers the odds of an abort rather than removing
   /// them.
   ///
-  /// This field is a floor, not the threshold. required_free_block()
-  /// returns the larger of it and the buffer's own growth step,
-  /// max_pending_ads * sizeof(BLEAdvertisement), and at the default 500
-  /// that growth term is around 30 kB — so the effective check is
-  /// several times this number. Worth knowing before tuning either
-  /// field, because raising max_pending_ads raises the bar for
-  /// buffering anything at all.
+  /// This threshold does not scale with max_pending_ads, and tying the
+  /// two is a mistake worth naming because it looks reasonable. The
+  /// element array is reserved in the constructor, restored after each
+  /// drain, and never grown on the ingest path — a push that would
+  /// exceed the reserved capacity trims the buffer instead. What the
+  /// ingest path allocates is the copied advertisement's name string
+  /// and payload vectors, which are small and do not depend on how
+  /// deep the buffer is. Requiring the whole array to be free on top of
+  /// that made a larger buffer less willing to accept anything — at
+  /// max_pending_ads = 500 the check asked for around 30 kB contiguous,
+  /// which an ESP32 running a scan never has, so every advertisement
+  /// was dropped.
   ///
   /// It is not a handshake reservation either way. A fresh TLS
   /// handshake needed a 32.8 kB contiguous block when measured on an
@@ -254,8 +271,9 @@ class BLESignalKGateway {
 
   /// @brief Re-reserve the pending buffer after a batch has been drained and
   /// freed. Kept separate from the drain so the two element arrays are never
-  /// alive at the same time; at the default max_pending_ads that would need
-  /// two ~28 kB contiguous blocks, which an ESP32 running a scan cannot give.
+  /// alive at the same time; that would need two contiguous blocks of
+  /// max_pending_ads * sizeof(BLEAdvertisement), and an ESP32 running a scan
+  /// has around 8 kB contiguous to give.
   void restore_pending_capacity();
 
   // FreeRTOS task that runs post_pending_advertisements() on a
@@ -305,9 +323,6 @@ class BLESignalKGateway {
    *                    identity resolves to kUnavailable instead.
    */
   Transport resolve_transport(String& ca_pem, String& common_name) const;
-
-  /// Contiguous internal memory that must be free to buffer safely.
-  size_t required_free_block() const;
 
   /**
    * @brief Make sure the advertisement POST client exists and matches

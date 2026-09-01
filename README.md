@@ -90,7 +90,7 @@ auto app = builder.set_hostname("signalk-ble-gw")->get_app();
 
 // The library's defaults scan actively with the radio always on, which
 // suits a chip whose only job is BLE. Sharing one with WiFi and TLS
-// wants a lower duty cycle and a smaller buffer — see the memory note.
+// wants a lower duty cycle — see the memory note.
 NativeBLEConfig ble_cfg;
 ble_cfg.active_scan = false;
 ble_cfg.scan_interval_ms = 320;
@@ -98,7 +98,6 @@ ble_cfg.scan_window_ms = 30;
 auto ble = std::make_shared<NativeBLE>(ble_cfg);
 
 BLESignalKGatewayConfig gw_cfg;
-gw_cfg.max_pending_ads = 50;
 
 auto gateway =
     std::make_shared<BLESignalKGateway>(ble, app->get_ws_client(), gw_cfg);
@@ -158,17 +157,19 @@ allocations on the Bluetooth callback, and these builds compile without
 exceptions — an allocation that cannot be satisfied aborts the device instead of
 throwing, and the containers involved offer no failure-reporting form to check.
 The gateway therefore declines to buffer once the largest free block of internal
-memory falls below `min_largest_free_block` (8 kB by default, raised to fit the
-configured buffer), dropping the advertisement and counting it. That is an
-admission check rather than a guarantee: it does not reserve the memory, so it
-lowers the chance of an abort rather than removing it.
+memory falls below `min_largest_free_block`, dropping the advertisement and
+counting it. That is an admission check rather than a guarantee: it does not
+reserve the memory, so it lowers the chance of an abort rather than removing it.
+The threshold stands on its own and does not scale with `max_pending_ads`.
 
 Keeping that headroom is the job of the scan settings. The examples scan
-passively at roughly a 9% duty cycle rather than the library's own
-always-on active scan, and buffer 50 advertisements rather than 500; the
-ESP32-C3 and C5 additionally turn the control WebSocket off, since it is a
-second long-lived connection. If a build still runs out of heap, those are the
-knobs to reach for.
+passively at a low duty cycle rather than the library's own always-on active
+scan; the ESP32-C3 and C5 additionally turn the control WebSocket off, since it
+is a second long-lived connection. `max_pending_ads` is the other knob, and it
+is a standing cost rather than a ceiling — the element array is reserved up
+front — so raise it only on a chip with the internal RAM to spare. The header
+documents what each field costs; the examples show the settings a shared radio
+wants.
 
 Flash is tight as well. Built `-Os` into a 1.9 MB OTA slot, the native example
 uses 89% of it on the ESP32 and the ESP32-S3 and 97% on the ESP32-C3, whose
