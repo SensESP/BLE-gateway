@@ -594,7 +594,6 @@ bool BLESignalKGateway::post_pending_advertisements(bool allow_empty) {
   // without the Authorization header.
 
   // Drain the pending buffer under the mutex.
-  BLE_GW_HEAP_PROBE("drain.pre", pending_ads_.size(), pending_ads_.capacity());
   // Declared before to_post so it destructs after it: the batch's array is
   // already freed by the time the buffer's is allocated, so only one of the
   // two is ever live. Covers every return path out of this function.
@@ -607,6 +606,7 @@ bool BLESignalKGateway::post_pending_advertisements(bool allow_empty) {
   if (xSemaphoreTake(pending_ads_mutex_, pdMS_TO_TICKS(200)) != pdTRUE) {
     return false;
   }
+  BLE_GW_HEAP_PROBE("drain.pre", pending_ads_.size(), pending_ads_.capacity());
   to_post.swap(pending_ads_);
   // Enough capacity to absorb the advertisements that arrive before the full
   // reservation is restored, so the GAP callback does not have to grow the
@@ -616,7 +616,11 @@ bool BLESignalKGateway::post_pending_advertisements(bool allow_empty) {
   pending_ads_.reserve(config_.max_pending_ads < kDrainWindowReserve
                            ? config_.max_pending_ads
                            : kDrainWindowReserve);
-  BLE_GW_HEAP_PROBE("drain.swapped", to_post.size(), pending_ads_.capacity());
+  // Snapshot under the mutex. The probes below run after the give, and the BLE
+  // callback pushes into pending_ads_ concurrently, so reading capacity() there
+  // would be a race for a number that does not change until the restore.
+  [[maybe_unused]] const size_t drain_capacity = pending_ads_.capacity();
+  BLE_GW_HEAP_PROBE("drain.swapped", to_post.size(), drain_capacity);
   xSemaphoreGive(pending_ads_mutex_);
   // The full reservation is deliberately deferred until the batch has been
   // serialized and freed; restore_pending_capacity() below does that. Taking it
@@ -642,37 +646,43 @@ bool BLESignalKGateway::post_pending_advertisements(bool allow_empty) {
     return false;
   }
 
-  // Build the JSON batch.
-  JsonDocument doc;
-  doc["gateway_id"] = SensESPBaseApp::get_hostname();
-  doc["hostname"] = SensESPBaseApp::get_hostname();
-  doc["firmware"] = config_.firmware_version.length() > 0
-                        ? config_.firmware_version
-                        : String(kSensESPVersion);
-  doc["uptime"] = millis() / 1000;
-  doc["free_heap"] = usable_free_heap();
-  if (ble_provisioner_) {
-    String mac = ble_provisioner_->mac_address();
-    if (mac.length() > 0) {
-      doc["mac"] = mac;
-    }
-  }
-  JsonArray devices = doc["devices"].to<JsonArray>();
-  for (const auto& ad : to_post) {
-    JsonObject dev = devices.add<JsonObject>();
-    dev["mac"] = ad.address;
-    dev["rssi"] = ad.rssi;
-    if (ad.name.length() > 0) {
-      dev["name"] = ad.name;
-    }
-    if (!ad.adv_data.empty()) {
-      dev["adv_data"] = bytes_to_hex(ad.adv_data);
-    }
-  }
-
+  // Build the JSON batch. The document is scoped so it is destroyed the moment
+  // it has been serialized: it holds a copy of every string in the batch, and
+  // the POST that follows needs the space more than a tree nobody reads again.
   String body;
-  serializeJson(doc, body);
-  BLE_GW_HEAP_PROBE("body.built", batch_size, pending_ads_.capacity());
+  BLE_GW_HEAP_PROBE("doc.pre", batch_size, drain_capacity);
+  {
+    JsonDocument doc;
+    doc["gateway_id"] = SensESPBaseApp::get_hostname();
+    doc["hostname"] = SensESPBaseApp::get_hostname();
+    doc["firmware"] = config_.firmware_version.length() > 0
+                          ? config_.firmware_version
+                          : String(kSensESPVersion);
+    doc["uptime"] = millis() / 1000;
+    doc["free_heap"] = usable_free_heap();
+    if (ble_provisioner_) {
+      String mac = ble_provisioner_->mac_address();
+      if (mac.length() > 0) {
+        doc["mac"] = mac;
+      }
+    }
+    JsonArray devices = doc["devices"].to<JsonArray>();
+    for (const auto& ad : to_post) {
+      JsonObject dev = devices.add<JsonObject>();
+      dev["mac"] = ad.address;
+      dev["rssi"] = ad.rssi;
+      if (ad.name.length() > 0) {
+        dev["name"] = ad.name;
+      }
+      if (!ad.adv_data.empty()) {
+        dev["adv_data"] = bytes_to_hex(ad.adv_data);
+      }
+    }
+
+    serializeJson(doc, body);
+    BLE_GW_HEAP_PROBE("doc.live", batch_size, drain_capacity);
+  }
+  BLE_GW_HEAP_PROBE("body.built", batch_size, drain_capacity);
 
   // The batch is serialized into body and nothing downstream reads it, so
   // release it and restore the reservation now rather than at function exit.
