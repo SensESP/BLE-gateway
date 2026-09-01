@@ -22,6 +22,19 @@ using namespace sensesp;
 static std::shared_ptr<NativeBLE> g_ble;
 static std::shared_ptr<BLESignalKGateway> g_gateway;
 
+// ESP.getFreeHeap() omits MALLOC_CAP_8BIT, so it counts the IRAM-only region
+// that cannot hold data — about 31 kB on an ESP32.
+static uint32_t usable_free_heap() {
+  return heap_caps_get_free_size(MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT);
+}
+
+// Free heap alone hides fragmentation: it rises while the largest block
+// collapses, and the block is what decides whether a TLS session sets up.
+static uint32_t largest_free_block() {
+  return heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL |
+                                          MALLOC_CAP_8BIT);
+}
+
 void setup() {
   SetupLogging(ESP_LOG_INFO);
 
@@ -61,9 +74,8 @@ void setup() {
              "alive — uptime=%lus heap=%u lfb=%u ble_hits=%u ble_scan=%d "
              "gw_rx=%u gw_posted=%u gw_dropped=%u post_ok=%u post_fail=%u "
              "ws_up=%d",
-             (unsigned long)(millis() / 1000), (unsigned)ESP.getFreeHeap(),
-             (unsigned)heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL |
-                                                        MALLOC_CAP_8BIT),
+             (unsigned long)(millis() / 1000), (unsigned)usable_free_heap(),
+             (unsigned)largest_free_block(),
              (unsigned)(g_ble ? g_ble->scan_hit_count() : 0),
              (int)(g_ble ? g_ble->is_scanning() : false),
              (unsigned)(g_gateway ? g_gateway->advertisements_received() : 0),

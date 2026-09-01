@@ -15,6 +15,14 @@ namespace sensesp {
 namespace {
 constexpr const char* kTag = "ble_gw";
 
+// Arduino's ESP.getFreeHeap() asks for MALLOC_CAP_INTERNAL without
+// MALLOC_CAP_8BIT, so it counts the IRAM-only region — about 31 kB on an
+// ESP32 — which is 32-bit-access-only and can never hold a buffer. Report what
+// an allocation can actually come from.
+uint32_t usable_free_heap() {
+  return heap_caps_get_free_size(MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT);
+}
+
 #ifdef BLE_GW_HEAP_TRACE
 // Largest contiguous internal block, which is what a TLS handshake needs and
 // what the advertisement buffer competes with. Free heap alone hides
@@ -496,7 +504,7 @@ void BLESignalKGateway::send_status() {
   doc["type"] = "status";
   doc["gateway_id"] = SensESPBaseApp::get_hostname();
   doc["uptime"] = millis() / 1000;
-  doc["free_heap"] = ESP.getFreeHeap();
+  doc["free_heap"] = usable_free_heap();
   doc["active_gatt_connections"] =
       ble_provisioner_ ? ble_provisioner_->active_gatt_connections() : 0;
   doc["max_gatt_connections"] =
@@ -621,7 +629,7 @@ bool BLESignalKGateway::post_pending_advertisements(bool allow_empty) {
                         ? config_.firmware_version
                         : String(kSensESPVersion);
   doc["uptime"] = millis() / 1000;
-  doc["free_heap"] = ESP.getFreeHeap();
+  doc["free_heap"] = usable_free_heap();
   if (ble_provisioner_) {
     String mac = ble_provisioner_->mac_address();
     if (mac.length() > 0) {
@@ -695,7 +703,7 @@ bool BLESignalKGateway::post_pending_advertisements(bool allow_empty) {
     http_post_success_.fetch_add(1, std::memory_order_relaxed);
     ESP_LOGI(kTag, "POST: forwarded %u adv, heap=%u",
              static_cast<unsigned>(batch_size),
-             static_cast<unsigned>(ESP.getFreeHeap()));
+             static_cast<unsigned>(usable_free_heap()));
     return true;
   }
 
@@ -704,7 +712,7 @@ bool BLESignalKGateway::post_pending_advertisements(bool allow_empty) {
 
   if (err != ESP_OK) {
     ESP_LOGW(kTag, "POST failed: %s, heap=%u", esp_err_to_name(err),
-             static_cast<unsigned>(ESP.getFreeHeap()));
+             static_cast<unsigned>(usable_free_heap()));
     // A kept-alive handle whose socket has died stays dead: esp_http_client
     // does not reset its state machine after a mid-request failure. Drop it
     // now rather than spending further intervals, and their timeouts, posting
@@ -725,7 +733,7 @@ bool BLESignalKGateway::post_pending_advertisements(bool allow_empty) {
              code);
   } else {
     ESP_LOGW(kTag, "POST failed: HTTP %d, heap=%u", code,
-             static_cast<unsigned>(ESP.getFreeHeap()));
+             static_cast<unsigned>(usable_free_heap()));
   }
 
   // The server answered, so the transport is healthy and rebuilding it would
