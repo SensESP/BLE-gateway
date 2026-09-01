@@ -1,5 +1,11 @@
 #include "sensesp_ble_gateway/ble_signalk_gateway.h"
 
+#include <string.h>
+
+#include <string>
+
+#include "sensesp_ble_gateway/advertisement_batch.h"
+
 #include "esp_heap_caps.h"
 #include "esp_http_client.h"
 
@@ -14,6 +20,7 @@ namespace sensesp {
 
 namespace {
 constexpr const char* kTag = "ble_gw";
+
 
 // Arduino's ESP.getFreeHeap() asks for MALLOC_CAP_INTERNAL without
 // MALLOC_CAP_8BIT, so it counts the IRAM-only region — about 31 kB on an
@@ -68,17 +75,6 @@ constexpr size_t kDrainWindowReserve = 32;
 String first_san(const String& san_set) {
   const int comma = san_set.indexOf(',');
   return comma < 0 ? san_set : san_set.substring(0, comma);
-}
-
-String bytes_to_hex(const std::vector<uint8_t>& data) {
-  String out;
-  out.reserve(data.size() * 2);
-  for (uint8_t b : data) {
-    char tmp[3];
-    snprintf(tmp, sizeof(tmp), "%02X", b);
-    out += tmp;
-  }
-  return out;
 }
 
 }  // namespace
@@ -234,6 +230,7 @@ void BLESignalKGateway::on_advertisement() {
                                       MALLOC_CAP_8BIT) <
       config_.min_largest_free_block) {
     adv_dropped_count_.fetch_add(1, std::memory_order_relaxed);
+    adv_dropped_no_memory_.fetch_add(1, std::memory_order_relaxed);
     return;
   }
 
@@ -243,14 +240,19 @@ void BLESignalKGateway::on_advertisement() {
   // as if it held one.
   if (config_.max_pending_ads == 0) {
     adv_dropped_count_.fetch_add(1, std::memory_order_relaxed);
+    adv_dropped_buffer_full_.fetch_add(1, std::memory_order_relaxed);
     return;
   }
 
   const BLEAdvertisement& ad = ble_provisioner_->get();
 
-  if (xSemaphoreTake(pending_ads_mutex_, pdMS_TO_TICKS(50)) != pdTRUE) {
-    // Could not grab the buffer mutex quickly enough — drop this
-    // advertisement rather than block the GAP event callback.
+  if (xSemaphoreTake(pending_ads_mutex_, 0) != pdTRUE) {
+    // Drop rather than block the GAP event callback: waiting here stalls the
+    // Bluetooth host task, and the advertisements the controller then discards
+    // never reach this counter at all. Every holder of this mutex swaps or
+    // reserves and gives it back, so a collision costs one advertisement.
+    // Counted in the total only: it is neither a memory shortage nor a full
+    // buffer, and folding it into either would misattribute contention.
     adv_dropped_count_.fetch_add(1, std::memory_order_relaxed);
     return;
   }
@@ -272,6 +274,7 @@ void BLESignalKGateway::on_advertisement() {
     const size_t dropped = pending_ads_.size() - keep;
     pending_ads_.erase(pending_ads_.begin(), pending_ads_.begin() + dropped);
     adv_dropped_count_.fetch_add(dropped, std::memory_order_relaxed);
+    adv_dropped_buffer_full_.fetch_add(dropped, std::memory_order_relaxed);
   }
   pending_ads_.push_back(ad);
   xSemaphoreGive(pending_ads_mutex_);
@@ -643,44 +646,57 @@ bool BLESignalKGateway::post_pending_advertisements(bool allow_empty) {
   if (post_backoff_ms_ > 0 &&
       static_cast<long>(millis() - post_backoff_until_ms_) < 0) {
     adv_dropped_count_.fetch_add(batch_size, std::memory_order_relaxed);
+    adv_dropped_undelivered_.fetch_add(batch_size, std::memory_order_relaxed);
     return false;
   }
 
-  // Build the JSON batch. The document is scoped so it is destroyed the moment
-  // it has been serialized: it holds a copy of every string in the batch, and
-  // the POST that follows needs the space more than a tree nobody reads again.
-  String body;
-  BLE_GW_HEAP_PROBE("doc.pre", batch_size, drain_capacity);
-  {
-    JsonDocument doc;
-    doc["gateway_id"] = SensESPBaseApp::get_hostname();
-    doc["hostname"] = SensESPBaseApp::get_hostname();
-    doc["firmware"] = config_.firmware_version.length() > 0
-                          ? config_.firmware_version
-                          : String(kSensESPVersion);
-    doc["uptime"] = millis() / 1000;
-    doc["free_heap"] = usable_free_heap();
-    if (ble_provisioner_) {
-      String mac = ble_provisioner_->mac_address();
-      if (mac.length() > 0) {
-        doc["mac"] = mac;
-      }
-    }
-    JsonArray devices = doc["devices"].to<JsonArray>();
-    for (const auto& ad : to_post) {
-      JsonObject dev = devices.add<JsonObject>();
-      dev["mac"] = ad.address;
-      dev["rssi"] = ad.rssi;
-      if (ad.name.length() > 0) {
-        dev["name"] = ad.name;
-      }
-      if (!ad.adv_data.empty()) {
-        dev["adv_data"] = bytes_to_hex(ad.adv_data);
-      }
-    }
+  // Build the batch body. Sized by BatchCounter, then filled by BatchAppender;
+  // see advertisement_batch.h for why the two passes are separate.
+  BLE_GW_HEAP_PROBE("body.pre", batch_size, drain_capacity);
+  const String gateway_id = SensESPBaseApp::get_hostname();
+  const String firmware = config_.firmware_version.length() > 0
+                              ? config_.firmware_version
+                              : String(kSensESPVersion);
+  String own_mac;
+  if (ble_provisioner_) {
+    own_mac = ble_provisioner_->mac_address();
+  }
+  const BatchHeader header{gateway_id.c_str(),
+                           gateway_id.length(),
+                           firmware.c_str(),
+                           firmware.length(),
+                           own_mac.c_str(),
+                           own_mac.length(),
+                           static_cast<uint32_t>(millis() / 1000),
+                           usable_free_heap()};
+  const auto device_at = [&to_post](size_t i) {
+    const BLEAdvertisement& ad = to_post[i];
+    return BatchDevice{ad.address.c_str(),
+                       ad.address.length(),
+                       ad.rssi,
+                       ad.name.c_str(),
+                       ad.name.length(),
+                       ad.adv_data.data(),
+                       ad.adv_data.size()};
+  };
 
-    serializeJson(doc, body);
-    BLE_GW_HEAP_PROBE("doc.live", batch_size, drain_capacity);
+  std::string body;
+  size_t counted = 0;
+  {
+    BatchCounter counter;
+    write_batch(counter, header, to_post.size(), device_at);
+    counted = counter.length();
+    body.reserve(counted);
+  }
+  BatchAppender appender(body);
+  write_batch(appender, header, to_post.size(), device_at);
+  if (body.size() != counted) {
+    // The two passes derive their byte counts from different functions, so a
+    // mismatch means one was edited without the other. It costs a realloc
+    // here; it would cost a silent truncation in anything using a fixed buffer.
+    ESP_LOGW(kTag, "batch size mismatch: counted %u, wrote %u",
+             static_cast<unsigned>(counted),
+             static_cast<unsigned>(body.size()));
   }
   BLE_GW_HEAP_PROBE("body.built", batch_size, drain_capacity);
 
@@ -699,6 +715,7 @@ bool BLESignalKGateway::post_pending_advertisements(bool allow_empty) {
   if (transport == Transport::kUnavailable) {
     http_post_fail_.fetch_add(1, std::memory_order_relaxed);
     adv_dropped_count_.fetch_add(batch_size, std::memory_order_relaxed);
+    adv_dropped_undelivered_.fetch_add(batch_size, std::memory_order_relaxed);
     return false;
   }
   const bool use_tls = transport == Transport::kTls;
@@ -709,6 +726,7 @@ bool BLESignalKGateway::post_pending_advertisements(bool allow_empty) {
   if (!ensure_post_client(url, ca_pem, common_name)) {
     http_post_fail_.fetch_add(1, std::memory_order_relaxed);
     adv_dropped_count_.fetch_add(batch_size, std::memory_order_relaxed);
+    adv_dropped_undelivered_.fetch_add(batch_size, std::memory_order_relaxed);
     return false;
   }
 
@@ -740,6 +758,7 @@ bool BLESignalKGateway::post_pending_advertisements(bool allow_empty) {
 
   http_post_fail_.fetch_add(1, std::memory_order_relaxed);
   adv_dropped_count_.fetch_add(batch_size, std::memory_order_relaxed);
+  adv_dropped_undelivered_.fetch_add(batch_size, std::memory_order_relaxed);
 
   if (err != ESP_OK) {
     ESP_LOGW(kTag, "POST failed: %s, heap=%u", esp_err_to_name(err),

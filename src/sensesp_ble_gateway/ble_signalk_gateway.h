@@ -34,8 +34,12 @@ namespace sensesp {
  * while the class is still incomplete.)
  */
 struct BLESignalKGatewayConfig {
-  /// HTTP POST interval in ms. Default 2000.
-  uint32_t post_interval_ms = 2000;
+  /// HTTP POST interval in ms. Default 500.
+  ///
+  /// The interval sets how much the buffer has to hold, so the two are chosen
+  /// together: draining more often means holding fewer advertisements, and the
+  /// body built from them is smaller in proportion.
+  uint32_t post_interval_ms = 500;
 
   /// Control WS status-message interval in ms. Default 30000.
   uint32_t status_interval_ms = 30000;
@@ -43,20 +47,28 @@ struct BLESignalKGatewayConfig {
   /// Max pending advertisements buffered between POST flushes.
   /// If more arrive than this before the next flush, the buffer
   /// is drained to drop_oldest_keep_newest to avoid unbounded
-  /// memory growth. Default 50.
+  /// memory growth. Default 24.
+  ///
+  /// Sized for the POST interval above, and measured rather than guessed. A
+  /// busy anchorage delivers about 15 advertisements per second; a POST takes
+  /// long enough that the interval lands nearer 690 ms in practice, so a batch
+  /// runs to about 10, and arrivals are bursty enough that 16 still overflowed
+  /// in 11% of a 90 s run. 24 dropped nothing over the same run.
+  ///
+  /// Change both together or neither: a buffer sized for a shorter interval
+  /// than the one draining it discards the oldest half of every full batch,
+  /// which is what a 3 s interval against a 50-entry buffer used to do.
   ///
   /// The element array is reserved up front, so this is a standing
   /// commitment rather than a ceiling that is only reached under load:
   /// the array alone is this many times sizeof(BLEAdvertisement), and
   /// each buffered advertisement adds its own name string and payload
-  /// vectors on top. At 50 that is a few kilobytes; at 500 it is more
-  /// internal RAM than an ESP32 has free once WiFi, Bluedroid and one
-  /// TLS session have taken their share.
+  /// vectors on top.
   ///
   /// Buffering deeper than one POST interval is rarely useful either.
   /// Presence data ages: an advertisement held for half a minute
   /// describes where a sensor was, not where it is.
-  size_t max_pending_ads = 50;
+  size_t max_pending_ads = 24;
 
   /// Gateway firmware version string sent in the hello message.
   /// Empty string means use the SensESP library version.
@@ -213,6 +225,28 @@ class BLESignalKGateway {
   uint32_t advertisements_received() const { return adv_received_count_; }
   uint32_t advertisements_posted() const { return adv_posted_count_; }
   uint32_t advertisements_dropped() const { return adv_dropped_count_; }
+
+  /// Advertisements the ingest guard declined because the largest free block
+  /// was below min_largest_free_block.
+  uint32_t advertisements_dropped_no_memory() const {
+    return adv_dropped_no_memory_;
+  }
+
+  /// Advertisements discarded to make room in a full buffer. The remedy is
+  /// max_pending_ads or post_interval_ms, not the heap.
+  uint32_t advertisements_dropped_buffer_full() const {
+    return adv_dropped_buffer_full_;
+  }
+
+  /// Advertisements that reached a batch the POST could not deliver. The
+  /// remedy is the delivery connection, not the buffer.
+  ///
+  /// The three causes are counted separately because they had to be told
+  /// apart by arithmetic before: buffer-full drops arrive in multiples of
+  /// max_pending_ads / 2, which was the only way to attribute them.
+  uint32_t advertisements_dropped_undelivered() const {
+    return adv_dropped_undelivered_;
+  }
   uint32_t http_post_success() const { return http_post_success_; }
   uint32_t http_post_fail() const { return http_post_fail_; }
   uint32_t control_ws_connected_count() const { return ws_connected_count_; }
@@ -411,6 +445,9 @@ class BLESignalKGateway {
   std::atomic<uint32_t> adv_received_count_{0};
   std::atomic<uint32_t> adv_posted_count_{0};
   std::atomic<uint32_t> adv_dropped_count_{0};
+  std::atomic<uint32_t> adv_dropped_no_memory_{0};
+  std::atomic<uint32_t> adv_dropped_buffer_full_{0};
+  std::atomic<uint32_t> adv_dropped_undelivered_{0};
   std::atomic<uint32_t> http_post_success_{0};
   std::atomic<uint32_t> http_post_fail_{0};
   std::atomic<uint32_t> ws_connected_count_{0};

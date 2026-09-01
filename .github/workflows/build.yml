@@ -6,6 +6,19 @@ on:
   pull_request:
 
 jobs:
+  host-test:
+    runs-on: ubuntu-latest
+    # The job runs a script from the repository and needs nothing but the code.
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+
+      - name: Run host tests
+        run: ./test/host/run.sh
+
   pio-build:
     runs-on: ubuntu-latest
     strategy:
