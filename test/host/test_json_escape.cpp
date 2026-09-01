@@ -1,6 +1,3 @@
-// Host tests for the JSON string escaper. See json_escape.h for why it does
-// not use ArduinoJson.
-
 #include <cstdio>
 #include <cstdlib>
 #include <string>

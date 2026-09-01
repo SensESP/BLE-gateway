@@ -1,8 +1,6 @@
-// Host tests for the advertisement batch writer.
-//
-// ArduinoJson used to make the body structurally well-formed; it is now
-// assembled from literals, so these golden bodies are what holds the shape.
-// Every optional field and the device separator get a case.
+// The golden bodies are what holds the batch shape: the writer emits JSON as
+// literals, so nothing else would catch a lost comma or brace. Every optional
+// field and the device separator get a case.
 
 #include <cstdio>
 #include <cstdlib>
