@@ -4,7 +4,7 @@
 
 #include <string>
 
-#include "sensesp_ble_gateway/json_escape.h"
+#include "sensesp_ble_gateway/advertisement_batch.h"
 
 #include "esp_heap_caps.h"
 #include "esp_http_client.h"
@@ -21,116 +21,6 @@ namespace sensesp {
 namespace {
 constexpr const char* kTag = "ble_gw";
 
-// The advertisement batch is written straight into its buffer rather than
-// through a document tree. The schema is fixed, so a tree buys nothing and
-// costs a second copy of every string at the moment the POST needs the room.
-//
-// The body is written twice: once into Counter to learn the exact length, once
-// into Appender to fill a buffer reserved to it. Both passes run the same
-// write_batch() over the same sink interface, so they cannot disagree and the
-// buffer never reallocates as it grows.
-size_t number_text(long value, char* out) {
-  char buffer[12];
-  const int n = snprintf(buffer, sizeof(buffer), "%ld", value);
-  const size_t length = n < 0 ? 0 : static_cast<size_t>(n);
-  if (out != nullptr) {
-    memcpy(out, buffer, length);
-  }
-  return length;
-}
-
-class Counter {
- public:
-  template <size_t N>
-  void raw(const char (&)[N]) {
-    length_ += N - 1;
-  }
-  void quoted(const char* value, size_t length) {
-    length_ += json_quoted_length(value, length);
-  }
-  void number(long value) { length_ += number_text(value, nullptr); }
-  void hex(const std::vector<uint8_t>& bytes) { length_ += 2 * bytes.size(); }
-  size_t length() const { return length_; }
-
- private:
-  size_t length_ = 0;
-};
-
-class Appender {
- public:
-  explicit Appender(std::string& out) : out_(out) {}
-  template <size_t N>
-  void raw(const char (&literal)[N]) {
-    out_.append(literal, N - 1);
-  }
-  void quoted(const char* value, size_t length) {
-    json_append_quoted(out_, value, length);
-  }
-  void number(long value) {
-    char buffer[12];
-    out_.append(buffer, number_text(value, buffer));
-  }
-  void hex(const std::vector<uint8_t>& bytes) {
-    static constexpr char kDigits[] = "0123456789ABCDEF";
-    for (uint8_t b : bytes) {
-      out_.push_back(kDigits[b >> 4]);
-      out_.push_back(kDigits[b & 0x0f]);
-    }
-  }
-
- private:
-  std::string& out_;
-};
-
-struct BatchFields {
-  const String& gateway_id;
-  const String& firmware;
-  const String& mac;
-  unsigned long uptime_s;
-  uint32_t free_heap;
-};
-
-template <typename Sink>
-void write_batch(Sink& sink, const BatchFields& fields,
-                 const std::vector<BLEAdvertisement>& ads) {
-  sink.raw("{\"gateway_id\":");
-  sink.quoted(fields.gateway_id.c_str(), fields.gateway_id.length());
-  sink.raw(",\"hostname\":");
-  sink.quoted(fields.gateway_id.c_str(), fields.gateway_id.length());
-  sink.raw(",\"firmware\":");
-  sink.quoted(fields.firmware.c_str(), fields.firmware.length());
-  sink.raw(",\"uptime\":");
-  sink.number(static_cast<long>(fields.uptime_s));
-  sink.raw(",\"free_heap\":");
-  sink.number(static_cast<long>(fields.free_heap));
-  if (fields.mac.length() > 0) {
-    sink.raw(",\"mac\":");
-    sink.quoted(fields.mac.c_str(), fields.mac.length());
-  }
-  sink.raw(",\"devices\":[");
-  bool first = true;
-  for (const auto& ad : ads) {
-    if (!first) {
-      sink.raw(",");
-    }
-    first = false;
-    sink.raw("{\"mac\":");
-    sink.quoted(ad.address.c_str(), ad.address.length());
-    sink.raw(",\"rssi\":");
-    sink.number(ad.rssi);
-    if (ad.name.length() > 0) {
-      sink.raw(",\"name\":");
-      sink.quoted(ad.name.c_str(), ad.name.length());
-    }
-    if (!ad.adv_data.empty()) {
-      sink.raw(",\"adv_data\":\"");
-      sink.hex(ad.adv_data);
-      sink.raw("\"");
-    }
-    sink.raw("}");
-  }
-  sink.raw("]}");
-}
 
 // Arduino's ESP.getFreeHeap() asks for MALLOC_CAP_INTERNAL without
 // MALLOC_CAP_8BIT, so it counts the IRAM-only region — about 31 kB on an
@@ -752,28 +642,54 @@ bool BLESignalKGateway::post_pending_advertisements(bool allow_empty) {
     return false;
   }
 
-  // Build the batch body. Sized exactly, then filled: see write_batch() above.
+  // Build the batch body. Sized by BatchCounter, then filled by BatchAppender;
+  // see advertisement_batch.h for why the two passes are separate.
   BLE_GW_HEAP_PROBE("body.pre", batch_size, drain_capacity);
   const String gateway_id = SensESPBaseApp::get_hostname();
   const String firmware = config_.firmware_version.length() > 0
                               ? config_.firmware_version
                               : String(kSensESPVersion);
-  String mac;
+  String own_mac;
   if (ble_provisioner_) {
-    mac = ble_provisioner_->mac_address();
+    own_mac = ble_provisioner_->mac_address();
   }
-  const BatchFields fields{gateway_id, firmware, mac,
-                           static_cast<unsigned long>(millis() / 1000),
+  const BatchHeader header{gateway_id.c_str(),
+                           gateway_id.length(),
+                           firmware.c_str(),
+                           firmware.length(),
+                           own_mac.c_str(),
+                           own_mac.length(),
+                           static_cast<uint32_t>(millis() / 1000),
                            usable_free_heap()};
+  const auto device_at = [&to_post](size_t i) {
+    const BLEAdvertisement& ad = to_post[i];
+    return BatchDevice{ad.address.c_str(),
+                       ad.address.length(),
+                       ad.rssi,
+                       ad.name.c_str(),
+                       ad.name.length(),
+                       ad.adv_data.data(),
+                       ad.adv_data.size()};
+  };
 
   std::string body;
+  size_t counted = 0;
   {
-    Counter counter;
-    write_batch(counter, fields, to_post);
-    body.reserve(counter.length());
+    BatchCounter counter;
+    write_batch(counter, header, to_post.size(), device_at);
+    counted = counter.length();
+    body.reserve(counted);
   }
-  Appender appender(body);
-  write_batch(appender, fields, to_post);
+  BatchAppender appender(body);
+  write_batch(appender, header, to_post.size(), device_at);
+  if (body.size() != counted) {
+    // The two passes derive their byte counts from different functions, so a
+    // mismatch means one was edited without the other. It costs a realloc
+    // here; it would cost a silent truncation in anything using a fixed buffer.
+    ESP_LOGW(kTag, "batch size mismatch: counted %u, wrote %u",
+             static_cast<unsigned>(counted),
+             static_cast<unsigned>(body.size()));
+  }
   BLE_GW_HEAP_PROBE("body.built", batch_size, drain_capacity);
 
   // The batch is serialized into body and nothing downstream reads it, so

@@ -15,10 +15,13 @@ for test_src in "$here"/test_*.cpp; do
   # a test cannot quietly start depending on the whole library.
   case "$name" in
     test_json_escape) units=("$root/src/sensesp_ble_gateway/json_escape.cpp") ;;
+    test_advertisement_batch) units=("$root/src/sensesp_ble_gateway/json_escape.cpp") ;;
     *) echo "no unit list for $name"; exit 1 ;;
   esac
   echo "== $name"
-  g++ -std=c++17 -Wall -Wextra -Werror -I "$root/src" \
+  g++ -std=c++17 -Wall -Wextra -Werror \
+      -fsanitize=address,undefined -fno-omit-frame-pointer \
+      -I "$root/src" \
       -o "$out/$name" "$test_src" "${units[@]}"
   "$out/$name" || status=1
 done
