@@ -642,36 +642,42 @@ bool BLESignalKGateway::post_pending_advertisements(bool allow_empty) {
     return false;
   }
 
-  // Build the JSON batch.
-  JsonDocument doc;
-  doc["gateway_id"] = SensESPBaseApp::get_hostname();
-  doc["hostname"] = SensESPBaseApp::get_hostname();
-  doc["firmware"] = config_.firmware_version.length() > 0
-                        ? config_.firmware_version
-                        : String(kSensESPVersion);
-  doc["uptime"] = millis() / 1000;
-  doc["free_heap"] = usable_free_heap();
-  if (ble_provisioner_) {
-    String mac = ble_provisioner_->mac_address();
-    if (mac.length() > 0) {
-      doc["mac"] = mac;
-    }
-  }
-  JsonArray devices = doc["devices"].to<JsonArray>();
-  for (const auto& ad : to_post) {
-    JsonObject dev = devices.add<JsonObject>();
-    dev["mac"] = ad.address;
-    dev["rssi"] = ad.rssi;
-    if (ad.name.length() > 0) {
-      dev["name"] = ad.name;
-    }
-    if (!ad.adv_data.empty()) {
-      dev["adv_data"] = bytes_to_hex(ad.adv_data);
-    }
-  }
-
+  // Build the JSON batch. The document is scoped so it is destroyed the moment
+  // it has been serialized: it holds a copy of every string in the batch, and
+  // the POST that follows needs the space more than a tree nobody reads again.
   String body;
-  serializeJson(doc, body);
+  BLE_GW_HEAP_PROBE("doc.pre", batch_size, pending_ads_.capacity());
+  {
+    JsonDocument doc;
+    doc["gateway_id"] = SensESPBaseApp::get_hostname();
+    doc["hostname"] = SensESPBaseApp::get_hostname();
+    doc["firmware"] = config_.firmware_version.length() > 0
+                          ? config_.firmware_version
+                          : String(kSensESPVersion);
+    doc["uptime"] = millis() / 1000;
+    doc["free_heap"] = usable_free_heap();
+    if (ble_provisioner_) {
+      String mac = ble_provisioner_->mac_address();
+      if (mac.length() > 0) {
+        doc["mac"] = mac;
+      }
+    }
+    JsonArray devices = doc["devices"].to<JsonArray>();
+    for (const auto& ad : to_post) {
+      JsonObject dev = devices.add<JsonObject>();
+      dev["mac"] = ad.address;
+      dev["rssi"] = ad.rssi;
+      if (ad.name.length() > 0) {
+        dev["name"] = ad.name;
+      }
+      if (!ad.adv_data.empty()) {
+        dev["adv_data"] = bytes_to_hex(ad.adv_data);
+      }
+    }
+
+    serializeJson(doc, body);
+    BLE_GW_HEAP_PROBE("doc.live", batch_size, body.length());
+  }
   BLE_GW_HEAP_PROBE("body.built", batch_size, pending_ads_.capacity());
 
   // The batch is serialized into body and nothing downstream reads it, so
