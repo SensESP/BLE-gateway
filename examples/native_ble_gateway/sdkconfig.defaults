@@ -105,4 +105,5 @@ CONFIG_MBEDTLS_DYNAMIC_BUFFER=n
 # value the delta stream tolerates, and 8192 bought nothing here, so a smaller
 # one has nothing left to offer. Revisit when the session count drops; see
 # issues 22 and 27.
-CONFIG_MBEDTLS_SSL_IN_CONTENT_LEN=16384
+CONFIG_MBEDTLS_SSL_IN_CONTENT_LEN=8192
+CONFIG_MBEDTLS_SSL_OUT_CONTENT_LEN=2048
