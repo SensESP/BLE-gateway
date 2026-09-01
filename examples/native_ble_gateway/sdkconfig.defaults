@@ -70,17 +70,39 @@ CONFIG_HTTPD_MAX_REQ_HDR_LEN=1024
 # IDF default; pinned because nothing else holds it and the failure is silent.
 #
 # The cost is that every open session keeps its buffers for its lifetime:
-# about 16.4 kB in and 4.1 kB out. This gateway can hold three at once — the
-# POST client, the control WebSocket and SKWSClient's delta socket — so on a
-# board without PSRAM that is roughly 60 kB of internal RAM committed to TLS.
-# Turning the option on to reclaim that is what reintroduces the failure.
+# about 16.4 kB in and 4.1 kB out. This gateway opens three — the POST client,
+# the control WebSocket and SKWSClient's delta socket — which on a board without
+# PSRAM would be roughly 60 kB of internal RAM committed to TLS, and is why a
+# plain ESP32 establishes only the first of them. Turning the option on to
+# reclaim that is what reintroduces the failure.
 CONFIG_MBEDTLS_DYNAMIC_BUFFER=n
 
-# The record buffer cannot be trimmed to buy contiguous memory back. RFC 6066
-# max_fragment_length is how a client asks for smaller records, and Go's TLS
-# server does not implement it, so the server sends whatever fits its own
-# data. Measured by fetching a 350 kB asset from the same entrypoint — not a
-# response this endpoint returns, but it shows what the server is free to
-# send: at 8192 the transfer failed after 21775 bytes, at 4096 after 4090.
-# 16384 is the IDF default and is the only safe value.
+# TLS input record size, build-wide: it has to hold for every session the
+# firmware opens, not only the gateway's two. Nothing else can shrink the
+# buffer. CONFIG_MBEDTLS_SSL_VARIABLE_BUFFER_LENGTH is off, so the allocation is
+# this size whatever the peer negotiates, and nothing here negotiates: mbedTLS
+# compiles RFC 6066 max_fragment_length in but esp-tls never calls
+# mbedtls_ssl_conf_max_frag_len, and RFC 8449 record_size_limit, which replaces
+# it, is not compiled in at all.
+#
+# Two things arrive in the buffer. The handshake, whose largest message is the
+# server's certificate chain, and application data. Neither gateway channel
+# carries much of the latter: the advertisement POST is answered with a short
+# JSON object, and the control WebSocket receives only hello_ack,
+# gatt_subscribe, gatt_write and gatt_close, the largest of them an ATT payload
+# in hex. What binds the setting is SensESP's Signal K delta socket, which
+# shares it and reads whatever the server chooses to send.
+#
+# 8192 holds both the chain and the delta stream — production SensESP devices
+# run it against the same server — and it still bought nothing here. Only the
+# first of the three sessions establishes, at either size, and at 8192 the
+# failure lands later and harder: the websocket task is created,
+# mbedtls_ssl_setup then returns ALLOC_FAILED and the device reboots, where at
+# 16384 the task allocation fails first and the gateway stays up. Free heap came
+# out within 2% and the largest free block stayed in the same 2-3 kB band.
+#
+# 4096 was not measured. Earlier SensESP testing settled 8192 as the smallest
+# value the delta stream tolerates, and 8192 bought nothing here, so a smaller
+# one has nothing left to offer. Revisit when the session count drops; see
+# issues 22 and 27.
 CONFIG_MBEDTLS_SSL_IN_CONTENT_LEN=16384
