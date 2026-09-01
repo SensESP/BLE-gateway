@@ -441,10 +441,21 @@ void BLESignalKGateway::init_control_ws() {
     return;
   }
 
-  esp_websocket_register_events(control_ws_, WEBSOCKET_EVENT_ANY,
-                                &BLESignalKGateway::control_ws_event_trampoline,
-                                this);
-  esp_websocket_client_start(control_ws_);
+  esp_err_t err = esp_websocket_register_events(
+      control_ws_, WEBSOCKET_EVENT_ANY,
+      &BLESignalKGateway::control_ws_event_trampoline, this);
+  if (err == ESP_OK) {
+    err = esp_websocket_client_start(control_ws_);
+  }
+  if (err != ESP_OK) {
+    // Keeping a client that never started would make the failure permanent:
+    // the create-if-absent test above sees a non-null handle, and nothing
+    // rebuilds it. Starting allocates a task, so this fails exactly when the
+    // device is short of memory and the next attempt matters most.
+    ESP_LOGE(kTag, "control WS start failed: %s", esp_err_to_name(err));
+    esp_websocket_client_destroy(control_ws_);
+    control_ws_ = nullptr;
+  }
 
   xSemaphoreGive(control_ws_mutex_);
 }
