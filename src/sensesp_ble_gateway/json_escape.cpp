@@ -1,4 +1,4 @@
-#include "json_escape.h"
+#include "sensesp_ble_gateway/json_escape.h"
 
 namespace sensesp {
 namespace {

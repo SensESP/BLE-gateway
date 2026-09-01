@@ -1,7 +1,5 @@
-// Host tests for the JSON string escaper. Built and run by test/host/run.sh.
-//
-// The escaper exists because a BLE peer names itself and the gateway puts that
-// name in a POST body, so these cases are reachable from outside the device.
+// Host tests for the JSON string escaper. See json_escape.h for why it does
+// not use ArduinoJson.
 
 #include <cstdio>
 #include <cstdlib>

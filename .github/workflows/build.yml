@@ -8,12 +8,14 @@ on:
 jobs:
   host-test:
     runs-on: ubuntu-latest
+    # The job runs a script from the repository and needs nothing but the code.
+    permissions:
+      contents: read
     steps:
       - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
 
-      # The JSON escaper has no Arduino or IDF dependency, so it is tested with
-      # a compiler rather than a device. A BLE peer chooses its own advertised
-      # name, so its escaping is reachable from outside and worth a test.
       - name: Run host tests
         run: ./test/host/run.sh
 
