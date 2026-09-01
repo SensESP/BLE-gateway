@@ -246,11 +246,13 @@ void BLESignalKGateway::on_advertisement() {
 
   const BLEAdvertisement& ad = ble_provisioner_->get();
 
-  if (xSemaphoreTake(pending_ads_mutex_, pdMS_TO_TICKS(50)) != pdTRUE) {
-    // Could not grab the buffer mutex quickly enough — drop this
-    // advertisement rather than block the GAP event callback. Counted in the
-    // total only: it is neither a memory shortage nor a full buffer, and
-    // folding it into either would misattribute a contention problem.
+  if (xSemaphoreTake(pending_ads_mutex_, 0) != pdTRUE) {
+    // Drop rather than block the GAP event callback: waiting here stalls the
+    // Bluetooth host task, and the advertisements the controller then discards
+    // never reach this counter at all. Every holder of this mutex swaps or
+    // reserves and gives it back, so a collision costs one advertisement.
+    // Counted in the total only: it is neither a memory shortage nor a full
+    // buffer, and folding it into either would misattribute contention.
     adv_dropped_count_.fetch_add(1, std::memory_order_relaxed);
     return;
   }
