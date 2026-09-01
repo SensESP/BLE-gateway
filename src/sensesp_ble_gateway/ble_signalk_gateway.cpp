@@ -230,6 +230,7 @@ void BLESignalKGateway::on_advertisement() {
                                       MALLOC_CAP_8BIT) <
       config_.min_largest_free_block) {
     adv_dropped_count_.fetch_add(1, std::memory_order_relaxed);
+    adv_dropped_no_memory_.fetch_add(1, std::memory_order_relaxed);
     return;
   }
 
@@ -239,6 +240,7 @@ void BLESignalKGateway::on_advertisement() {
   // as if it held one.
   if (config_.max_pending_ads == 0) {
     adv_dropped_count_.fetch_add(1, std::memory_order_relaxed);
+    adv_dropped_buffer_full_.fetch_add(1, std::memory_order_relaxed);
     return;
   }
 
@@ -246,7 +248,9 @@ void BLESignalKGateway::on_advertisement() {
 
   if (xSemaphoreTake(pending_ads_mutex_, pdMS_TO_TICKS(50)) != pdTRUE) {
     // Could not grab the buffer mutex quickly enough — drop this
-    // advertisement rather than block the GAP event callback.
+    // advertisement rather than block the GAP event callback. Counted in the
+    // total only: it is neither a memory shortage nor a full buffer, and
+    // folding it into either would misattribute a contention problem.
     adv_dropped_count_.fetch_add(1, std::memory_order_relaxed);
     return;
   }
@@ -268,6 +272,7 @@ void BLESignalKGateway::on_advertisement() {
     const size_t dropped = pending_ads_.size() - keep;
     pending_ads_.erase(pending_ads_.begin(), pending_ads_.begin() + dropped);
     adv_dropped_count_.fetch_add(dropped, std::memory_order_relaxed);
+    adv_dropped_buffer_full_.fetch_add(dropped, std::memory_order_relaxed);
   }
   pending_ads_.push_back(ad);
   xSemaphoreGive(pending_ads_mutex_);
@@ -639,6 +644,7 @@ bool BLESignalKGateway::post_pending_advertisements(bool allow_empty) {
   if (post_backoff_ms_ > 0 &&
       static_cast<long>(millis() - post_backoff_until_ms_) < 0) {
     adv_dropped_count_.fetch_add(batch_size, std::memory_order_relaxed);
+    adv_dropped_undelivered_.fetch_add(batch_size, std::memory_order_relaxed);
     return false;
   }
 
@@ -707,6 +713,7 @@ bool BLESignalKGateway::post_pending_advertisements(bool allow_empty) {
   if (transport == Transport::kUnavailable) {
     http_post_fail_.fetch_add(1, std::memory_order_relaxed);
     adv_dropped_count_.fetch_add(batch_size, std::memory_order_relaxed);
+    adv_dropped_undelivered_.fetch_add(batch_size, std::memory_order_relaxed);
     return false;
   }
   const bool use_tls = transport == Transport::kTls;
@@ -717,6 +724,7 @@ bool BLESignalKGateway::post_pending_advertisements(bool allow_empty) {
   if (!ensure_post_client(url, ca_pem, common_name)) {
     http_post_fail_.fetch_add(1, std::memory_order_relaxed);
     adv_dropped_count_.fetch_add(batch_size, std::memory_order_relaxed);
+    adv_dropped_undelivered_.fetch_add(batch_size, std::memory_order_relaxed);
     return false;
   }
 
@@ -748,6 +756,7 @@ bool BLESignalKGateway::post_pending_advertisements(bool allow_empty) {
 
   http_post_fail_.fetch_add(1, std::memory_order_relaxed);
   adv_dropped_count_.fetch_add(batch_size, std::memory_order_relaxed);
+  adv_dropped_undelivered_.fetch_add(batch_size, std::memory_order_relaxed);
 
   if (err != ESP_OK) {
     ESP_LOGW(kTag, "POST failed: %s, heap=%u", esp_err_to_name(err),

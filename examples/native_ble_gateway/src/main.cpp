@@ -55,7 +55,6 @@ void setup() {
   g_ble = std::make_shared<NativeBLE>(ble_cfg);
 
   BLESignalKGatewayConfig gw_cfg;
-  gw_cfg.post_interval_ms = 3000;
   gw_cfg.max_gatt_sessions = g_ble->max_gatt_connections();
 #ifdef CONFIG_IDF_TARGET_ESP32C3
   // The C3 has a single 400 kB SRAM bank that WiFi, Bluedroid and TLS
@@ -72,7 +71,8 @@ void setup() {
   event_loop()->onRepeat(5000, []() {
     ESP_LOGI("GW",
              "alive — uptime=%lus heap=%u lfb=%u ble_hits=%u ble_scan=%d "
-             "gw_rx=%u gw_posted=%u gw_dropped=%u post_ok=%u post_fail=%u "
+             "gw_rx=%u gw_posted=%u gw_dropped=%u (mem=%u buf=%u und=%u) "
+             "post_ok=%u post_fail=%u "
              "ws_up=%d",
              (unsigned long)(millis() / 1000), (unsigned)usable_free_heap(),
              (unsigned)largest_free_block(),
@@ -81,6 +81,15 @@ void setup() {
              (unsigned)(g_gateway ? g_gateway->advertisements_received() : 0),
              (unsigned)(g_gateway ? g_gateway->advertisements_posted() : 0),
              (unsigned)(g_gateway ? g_gateway->advertisements_dropped() : 0),
+             (unsigned)(g_gateway
+                            ? g_gateway->advertisements_dropped_no_memory()
+                            : 0),
+             (unsigned)(g_gateway
+                            ? g_gateway->advertisements_dropped_buffer_full()
+                            : 0),
+             (unsigned)(g_gateway
+                            ? g_gateway->advertisements_dropped_undelivered()
+                            : 0),
              (unsigned)(g_gateway ? g_gateway->http_post_success() : 0),
              (unsigned)(g_gateway ? g_gateway->http_post_fail() : 0),
              (int)(g_gateway ? g_gateway->control_ws_connected() : false));

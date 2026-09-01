@@ -40,7 +40,6 @@ void setup() {
   g_ble = std::make_shared<NimBLEProvisioner>(ble_cfg);
 
   BLESignalKGatewayConfig gw_cfg;
-  gw_cfg.post_interval_ms = 3000;
   gw_cfg.enable_control_ws = false;  // Save RAM on the C5
   g_gateway =
       std::make_shared<BLESignalKGateway>(g_ble, app->get_ws_client(), gw_cfg);
