@@ -8,6 +8,7 @@
 
 #include "esp_heap_caps.h"
 #include "esp_http_client.h"
+#include "esp_tls.h"
 
 #include "esp_idf_version.h"
 #include "esp_log.h"
@@ -358,7 +359,35 @@ bool BLESignalKGateway::ensure_post_client(const String& url,
   // a redirect to http:// would carry it in the clear.
   cfg.disable_auto_redirect = true;
   if (post_ca_pem_.length() > 0) {
-    cfg.cert_pem = post_ca_pem_.c_str();
+    // SPIKE: the global store parses the CA once and keeps the parsed chain,
+    // where cfg.cert_pem re-parses it inside every connection attempt. The
+    // failing allocation is at the peak of an attempt, so moving an RSA-4096
+    // key context and a DER copy out of that peak is the point.
+    //
+    // Set once. destroy_post_client() clears post_ca_pem_ on every failure, so
+    // this cannot be keyed off that: re-setting per attempt reparses exactly
+    // what the store exists to avoid.
+    static String global_ca_pem;
+    static bool global_ca_ok = false;
+    if (global_ca_pem != post_ca_pem_) {
+      const esp_err_t ca_err = esp_tls_set_global_ca_store(
+          reinterpret_cast<const unsigned char*>(post_ca_pem_.c_str()),
+          post_ca_pem_.length() + 1);
+      global_ca_ok = ca_err == ESP_OK;
+      global_ca_pem = global_ca_ok ? post_ca_pem_ : String("");
+      ESP_LOGW(kTag, "SPIKE global CA store set: %s (pem=%u free=%u lfb=%u)",
+               esp_err_to_name(ca_err),
+               static_cast<unsigned>(post_ca_pem_.length()),
+               static_cast<unsigned>(heap_caps_get_free_size(
+                   MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT)),
+               static_cast<unsigned>(heap_caps_get_largest_free_block(
+                   MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT)));
+    }
+    if (global_ca_ok) {
+      cfg.use_global_ca_store = true;
+    } else {
+      cfg.cert_pem = post_ca_pem_.c_str();
+    }
     // resolve_transport() reports kUnavailable rather than hand out a CA with
     // no identity to bind it to, so the name check is never skipped here.
     // Without it the pinned CA would authorize any leaf it ever signed, and
