@@ -351,7 +351,7 @@ bool BLESignalKGateway::ensure_post_client(const String& url,
   esp_http_client_config_t cfg = {};
   cfg.url = post_url_.c_str();
   cfg.method = HTTP_METHOD_POST;
-  cfg.timeout_ms = 3000;
+  cfg.timeout_ms = 15000;  // SPIKE
   cfg.keep_alive_enable = true;
   // The advertisements endpoint is a fixed path on a known server. A
   // redirect would carry the bearer token to whatever host it names, and
