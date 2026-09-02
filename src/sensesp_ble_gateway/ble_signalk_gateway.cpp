@@ -742,7 +742,32 @@ bool BLESignalKGateway::post_pending_advertisements(bool allow_empty) {
   }
   esp_http_client_set_post_field(post_client_, body.c_str(), body.length());
 
+  // SPIKE instrumentation. Elapsed time separates a setup allocation failure,
+  // which returns at once, from a handshake that runs out of the client's
+  // timeout. The block figures are taken either side of the same call, so
+  // neither is a heartbeat sample from seconds away.
+  const uint32_t spike_t0 = millis();
+  const size_t spike_free_pre =
+      heap_caps_get_free_size(MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT);
+  const size_t spike_lfb_pre =
+      heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT);
+
   const esp_err_t err = esp_http_client_perform(post_client_);
+
+  const uint32_t spike_elapsed = millis() - spike_t0;
+  const size_t spike_free_post =
+      heap_caps_get_free_size(MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT);
+  const size_t spike_lfb_post =
+      heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT);
+  ESP_LOGW(kTag,
+           "SPIKE perform err=%s elapsed=%ums body=%u free=%u->%u lfb=%u->%u",
+           esp_err_to_name(err), static_cast<unsigned>(spike_elapsed),
+           static_cast<unsigned>(body.length()),
+           static_cast<unsigned>(spike_free_pre),
+           static_cast<unsigned>(spike_free_post),
+           static_cast<unsigned>(spike_lfb_pre),
+           static_cast<unsigned>(spike_lfb_post));
+
   const int code =
       err == ESP_OK ? esp_http_client_get_status_code(post_client_) : -err;
 
@@ -763,6 +788,14 @@ bool BLESignalKGateway::post_pending_advertisements(bool allow_empty) {
   if (err != ESP_OK) {
     ESP_LOGW(kTag, "POST failed: %s, heap=%u", esp_err_to_name(err),
              static_cast<unsigned>(usable_free_heap()));
+    // SPIKE: the per-region picture at the failure itself. Every failure would
+    // bury the log, so the first few and then a sample.
+    static unsigned spike_dumps = 0;
+    ++spike_dumps;
+    if (spike_dumps <= 3 || spike_dumps % 25 == 0) {
+      ESP_LOGW(kTag, "SPIKE region dump #%u", spike_dumps);
+      heap_caps_print_heap_info(MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT);
+    }
     // A kept-alive handle whose socket has died stays dead: esp_http_client
     // does not reset its state machine after a mid-request failure. Drop it
     // now rather than spending further intervals, and their timeouts, posting

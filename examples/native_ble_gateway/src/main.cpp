@@ -56,13 +56,9 @@ void setup() {
 
   BLESignalKGatewayConfig gw_cfg;
   gw_cfg.max_gatt_sessions = g_ble->max_gatt_connections();
-#ifdef CONFIG_IDF_TARGET_ESP32C3
-  // The C3 has a single 400 kB SRAM bank that WiFi, Bluedroid and TLS
-  // all draw from, and the control WebSocket is a second long-lived
-  // connection on top of the Signal K one. Advertisements still flow
-  // over the HTTP POST channel without it.
+  // SPIKE: unconditional so an ESP32 reproduces issue #22's two-session case.
+  // Upstream this is C3-only.
   gw_cfg.enable_control_ws = false;
-#endif
 
   g_gateway =
       std::make_shared<BLESignalKGateway>(g_ble, app->get_ws_client(), gw_cfg);
