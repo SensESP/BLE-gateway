@@ -742,7 +742,16 @@ bool BLESignalKGateway::post_pending_advertisements(bool allow_empty) {
   }
   esp_http_client_set_post_field(post_client_, body.c_str(), body.length());
 
+  // SPIKE probe: the largest block at the moment the session is created, not
+  // five seconds later in the heartbeat.
+  ESP_LOGW(kTag, "pre-perform: lfb=%u body=%u",
+           (unsigned)heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL |
+                                                      MALLOC_CAP_8BIT),
+           (unsigned)body.length());
   const esp_err_t err = esp_http_client_perform(post_client_);
+  ESP_LOGW(kTag, "post-perform: lfb=%u",
+           (unsigned)heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL |
+                                                      MALLOC_CAP_8BIT));
   const int code =
       err == ESP_OK ? esp_http_client_get_status_code(post_client_) : -err;
 
